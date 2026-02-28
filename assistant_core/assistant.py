@@ -7,6 +7,7 @@ from pathlib import Path
 import ollama
 
 from .config import MAX_SHORT_TERM_MESSAGES, MEMORY_FILE, SYSTEM_PROMPT
+from .executor import AutonomousExecutor
 from .tools import calculator, open_app, run_python_code, run_terminal_command
 
 
@@ -17,6 +18,7 @@ class AssistantWithMemory:
         self.workspace_dir = (Path(os.getcwd()) / "workspace").resolve()
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.memory = self.load_memory()
+        self.executor = AutonomousExecutor(self)
 
     def load_memory(self):
         if not os.path.exists(self.memory_file):
@@ -314,6 +316,22 @@ class AssistantWithMemory:
                 return plan
         return None
 
+    def mark_plan_step_completed(self, plan_id, step_no):
+        plan = self.get_plan_by_id(plan_id)
+        if not plan:
+            return False
+
+        for step in plan.get("steps", []):
+            if step.get("step") == step_no:
+                step["status"] = "completed"
+                task_id = step.get("task_id")
+                if isinstance(task_id, int):
+                    self.complete_task(str(task_id))
+                else:
+                    self.sync_plan_step_statuses_from_tasks()
+                return True
+        return False
+
     def extract_plan_command(self, user_message):
         msg = user_message.strip()
         msg_lower = msg.lower()
@@ -335,6 +353,17 @@ class AssistantWithMemory:
                 goal = match.group(1).strip()
                 if goal:
                     return {"action": "create", "goal": goal}
+
+        return None
+
+    def extract_autonomous_command(self, user_message):
+        msg_lower = user_message.strip().lower()
+
+        if msg_lower in {"autonomous status", "status autonomous", "autonomy status"}:
+            return {"action": "status"}
+
+        if re.search(r"\brun\s+autonomous(?:\s+cycle)?\b", msg_lower) or msg_lower in {"autonomous", "run autonomy"}:
+            return {"action": "run_cycle"}
 
         return None
 
@@ -595,6 +624,16 @@ class AssistantWithMemory:
             result = self.execute_file_command(payload, approved=True)
             self._clear_pending_action()
             return result
+        if action_type == "system_command" and isinstance(payload, dict):
+            command = str(payload.get("command", "")).strip()
+            result = run_terminal_command(command)
+            plan_id = payload.get("plan_id")
+            step_no = payload.get("step")
+            if result.startswith("[exit 0]") and isinstance(plan_id, int) and isinstance(step_no, int):
+                if self.mark_plan_step_completed(plan_id, step_no):
+                    result += f"\nAutonomy: marked Plan #{plan_id} Step {step_no} as completed."
+            self._clear_pending_action()
+            return result
         self._clear_pending_action()
         return "Pending action was invalid and has been cleared."
 
@@ -696,13 +735,22 @@ class AssistantWithMemory:
             return final_reply
 
         plan_cmd = self.extract_plan_command(user_message)
+        autonomous_cmd = self.extract_autonomous_command(user_message)
         task_cmd = self.extract_task_command(user_message)
         file_cmd = self.extract_file_command(user_message)
         system_cmd = self.extract_system_command(user_message)
         expression = self.extract_math_expression(user_message)
         code = self.extract_python_code(user_message)
 
-        if plan_cmd:
+        if autonomous_cmd:
+            action = autonomous_cmd["action"]
+            if action == "run_cycle":
+                final_reply = self.executor.run_cycle()
+            elif action == "status":
+                final_reply = self.executor.status_text()
+            else:
+                final_reply = "I could not process that autonomous command."
+        elif plan_cmd:
             action = plan_cmd["action"]
             if action == "create":
                 plan = self.create_plan(plan_cmd["goal"], auto_add_tasks=True)
