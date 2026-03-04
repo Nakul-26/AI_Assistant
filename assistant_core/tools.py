@@ -1,7 +1,40 @@
+import json
 import os
 import shlex
 import shutil
 import subprocess
+
+TOOLS = {
+    "list_files": {
+        "description": "List files in the workspace directory.",
+        "args": {},
+        "required": [],
+    },
+    "read_file": {
+        "description": "Read a file from workspace.",
+        "args": {"path": "string"},
+        "required": ["path"],
+    },
+    "write_file": {
+        "description": "Write content to a file in workspace (overwrites when approved).",
+        "args": {"path": "string", "content": "string"},
+        "required": ["path", "content"],
+    },
+    "run_command": {
+        "description": "Run an allowed terminal command.",
+        "args": {"command": "string"},
+        "required": ["command"],
+    },
+    "open_app": {
+        "description": "Launch an allowed application.",
+        "args": {"app": "string"},
+        "required": ["app"],
+    },
+}
+
+
+def tools_prompt_text() -> str:
+    return json.dumps(TOOLS, indent=2, ensure_ascii=False)
 
 
 def calculator(expression: str) -> str:

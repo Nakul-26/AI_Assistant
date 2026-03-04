@@ -6,9 +6,9 @@ from pathlib import Path
 
 import ollama
 
-from .config import MAX_SHORT_TERM_MESSAGES, MEMORY_FILE, SYSTEM_PROMPT
+from .config import MAX_SHORT_TERM_MESSAGES, MAX_TOOL_STEPS, MAX_TOOL_TRACES, MEMORY_FILE, SYSTEM_PROMPT
 from .executor import AutonomousExecutor
-from .tools import calculator, open_app, run_python_code, run_terminal_command
+from .tools import TOOLS, calculator, open_app, run_python_code, run_terminal_command, tools_prompt_text
 
 
 class AssistantWithMemory:
@@ -22,7 +22,14 @@ class AssistantWithMemory:
 
     def load_memory(self):
         if not os.path.exists(self.memory_file):
-            return {"short_term": [], "long_term": {}, "tasks": [], "plans": [], "pending_action": None}
+            return {
+                "short_term": [],
+                "long_term": {},
+                "tasks": [],
+                "plans": [],
+                "pending_action": None,
+                "tool_traces": [],
+            }
         try:
             with open(self.memory_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -34,6 +41,7 @@ class AssistantWithMemory:
                     "tasks": [],
                     "plans": [],
                     "pending_action": None,
+                    "tool_traces": [],
                 }
 
             if isinstance(data, dict):
@@ -42,6 +50,7 @@ class AssistantWithMemory:
                 tasks = data.get("tasks", [])
                 plans = data.get("plans", [])
                 pending_action = data.get("pending_action")
+                tool_traces = data.get("tool_traces", [])
                 if not isinstance(short_term, list):
                     short_term = []
                 if not isinstance(long_term, dict):
@@ -52,17 +61,34 @@ class AssistantWithMemory:
                     plans = []
                 if pending_action is not None and not isinstance(pending_action, dict):
                     pending_action = None
+                if not isinstance(tool_traces, list):
+                    tool_traces = []
                 return {
                     "short_term": short_term[-MAX_SHORT_TERM_MESSAGES:],
                     "long_term": long_term,
                     "tasks": tasks,
                     "plans": plans,
                     "pending_action": pending_action,
+                    "tool_traces": tool_traces[-MAX_TOOL_TRACES:],
                 }
 
-            return {"short_term": [], "long_term": {}, "tasks": [], "plans": [], "pending_action": None}
+            return {
+                "short_term": [],
+                "long_term": {},
+                "tasks": [],
+                "plans": [],
+                "pending_action": None,
+                "tool_traces": [],
+            }
         except Exception:
-            return {"short_term": [], "long_term": {}, "tasks": [], "plans": [], "pending_action": None}
+            return {
+                "short_term": [],
+                "long_term": {},
+                "tasks": [],
+                "plans": [],
+                "pending_action": None,
+                "tool_traces": [],
+            }
 
     def save_memory(self):
         try:
@@ -75,6 +101,21 @@ class AssistantWithMemory:
         self.memory["short_term"].append({"role": role, "content": content})
         if len(self.memory["short_term"]) > MAX_SHORT_TERM_MESSAGES:
             self.memory["short_term"] = self.memory["short_term"][-MAX_SHORT_TERM_MESSAGES:]
+
+    def add_tool_trace(self, request, step, action_payload, result):
+        self.memory.setdefault("tool_traces", [])
+        self.memory["tool_traces"].append(
+            {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "request": str(request or "").strip(),
+                "step": step,
+                "action": action_payload.get("action"),
+                "args": action_payload.get("args", {}),
+                "result": str(result or ""),
+            }
+        )
+        if len(self.memory["tool_traces"]) > MAX_TOOL_TRACES:
+            self.memory["tool_traces"] = self.memory["tool_traces"][-MAX_TOOL_TRACES:]
 
     def extract_long_term_memory(self, user_message):
         msg = user_message.strip()
@@ -101,21 +142,119 @@ class AssistantWithMemory:
         if "for reference" in msg_lower and "yes" in msg_lower:
             self.memory["long_term"]["reference_memory_enabled"] = True
 
-    def ask_ai(self):
+    def _memory_context_text(self):
         long_term_info = json.dumps(self.memory["long_term"], indent=2, ensure_ascii=False)
         open_tasks = [t for t in self.memory["tasks"] if t.get("status") != "completed"]
         tasks_info = json.dumps(open_tasks, indent=2, ensure_ascii=False)
         active_plans = [p for p in self.memory.get("plans", []) if p.get("status") != "completed"]
         plans_info = json.dumps(active_plans, indent=2, ensure_ascii=False)
-        system_with_memory = (
-            f"{SYSTEM_PROMPT}\n"
+        return (
             f"Long-term user memory:\n{long_term_info}\n\n"
             f"Open tasks/goals:\n{tasks_info}\n\n"
             f"Active plans:\n{plans_info}"
         )
+
+    def ask_ai(self):
+        system_with_memory = f"{SYSTEM_PROMPT}\n{self._memory_context_text()}"
         messages = [{"role": "system", "content": system_with_memory}] + self.memory["short_term"]
         response = ollama.chat(model=self.model, messages=messages)
         return response["message"]["content"]
+
+    def parse_json_tool_action(self, response_text):
+        payload = self._extract_json_object(response_text)
+        if not isinstance(payload, dict):
+            return None
+
+        action = str(payload.get("action", "")).strip()
+        args = payload.get("args", {})
+        if not action or not isinstance(args, dict):
+            return None
+
+        schema = TOOLS.get(action)
+        if not schema:
+            return None
+
+        for key in schema.get("required", []):
+            value = args.get(key)
+            if not isinstance(value, str) or not value.strip():
+                return None
+
+        return {"action": action, "args": args}
+
+    def execute_json_tool_action(self, action_payload):
+        action = action_payload["action"]
+        args = action_payload.get("args", {})
+
+        if action == "list_files":
+            return self.execute_file_command({"action": "list"})
+        if action == "read_file":
+            return self.execute_file_command({"action": "read", "path": args.get("path", "")})
+        if action == "write_file":
+            return self.execute_file_command(
+                {
+                    "action": "create",
+                    "path": args.get("path", ""),
+                    "content": str(args.get("content", "")),
+                }
+            )
+        if action == "run_command":
+            return run_terminal_command(str(args.get("command", "")))
+        if action == "open_app":
+            return open_app(str(args.get("app", "")))
+
+        return f"Unsupported tool action: {action}"
+
+    def ask_ai_with_json_tools(self, user_message=""):
+        tool_prompt = (
+            f"{SYSTEM_PROMPT}\n"
+            "You are a local AI assistant that can use tools.\n"
+            "When a tool is needed, respond ONLY valid JSON in this exact shape:\n"
+            '{"action":"<tool_name>","args":{...}}\n'
+            "No markdown, no code fences.\n"
+            "If no tool is needed, respond with normal text.\n"
+            "After tool results are provided, decide whether another tool is needed or provide the final answer.\n\n"
+            "Available tools:\n"
+            f"{tools_prompt_text()}\n\n"
+            f"{self._memory_context_text()}"
+        )
+        messages = [{"role": "system", "content": tool_prompt}] + list(self.memory["short_term"])
+
+        for step_index in range(1, MAX_TOOL_STEPS + 1):
+            response = ollama.chat(model=self.model, messages=messages)
+            content = response["message"]["content"]
+            messages.append({"role": "assistant", "content": content})
+
+            parsed_action = self.parse_json_tool_action(content)
+            if not parsed_action:
+                return content
+
+            tool_result = self.execute_json_tool_action(parsed_action)
+            self.add_tool_trace(user_message, step_index, parsed_action, tool_result)
+            if isinstance(self.memory.get("pending_action"), dict) or "Reply 'yes'" in tool_result:
+                return tool_result
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Tool execution result:\n"
+                        f"{tool_result}\n\n"
+                        "If more tools are required, return a JSON action. Otherwise give the final user response."
+                    ),
+                }
+            )
+
+        final_response = ollama.chat(
+            model=self.model,
+            messages=messages
+            + [
+                {
+                    "role": "user",
+                    "content": "Return a final text response for the user now. Do not call any more tools.",
+                }
+            ],
+        )
+        return final_response["message"]["content"]
 
     def _next_task_id(self):
         max_id = 0
@@ -801,7 +940,7 @@ class AssistantWithMemory:
         elif code:
             final_reply = run_python_code(code)
         else:
-            final_reply = self.ask_ai()
+            final_reply = self.ask_ai_with_json_tools(user_message=user_message)
 
         self.add_to_short_term("assistant", final_reply)
         self.save_memory()
