@@ -6,7 +6,15 @@ from pathlib import Path
 
 import ollama
 
-from .config import MAX_SHORT_TERM_MESSAGES, MAX_TOOL_STEPS, MAX_TOOL_TRACES, MEMORY_FILE, SYSTEM_PROMPT
+from .config import (
+    MAX_TOOL_RESULT_CHARS,
+    MAX_SHORT_TERM_MESSAGES,
+    MAX_TOOL_STEPS,
+    MAX_TOOL_TRACES,
+    MEMORY_FILE,
+    SYSTEM_PROMPT,
+    TOOL_TIMEOUT_SECONDS,
+)
 from .executor import AutonomousExecutor
 from .tools import TOOLS, calculator, open_app, run_python_code, run_terminal_command, tools_prompt_text
 
@@ -157,7 +165,7 @@ class AssistantWithMemory:
     def ask_ai(self):
         system_with_memory = f"{SYSTEM_PROMPT}\n{self._memory_context_text()}"
         messages = [{"role": "system", "content": system_with_memory}] + self.memory["short_term"]
-        response = ollama.chat(model=self.model, messages=messages)
+        response = self._chat_with_role_fallback(messages)
         return response["message"]["content"]
 
     def parse_json_tool_action(self, response_text):
@@ -198,7 +206,7 @@ class AssistantWithMemory:
                 }
             )
         if action == "run_command":
-            return run_terminal_command(str(args.get("command", "")))
+            return run_terminal_command(str(args.get("command", "")), timeout_seconds=TOOL_TIMEOUT_SECONDS)
         if action == "open_app":
             return open_app(str(args.get("app", "")))
 
@@ -212,7 +220,9 @@ class AssistantWithMemory:
             '{"action":"<tool_name>","args":{...}}\n'
             "No markdown, no code fences.\n"
             "If no tool is needed, respond with normal text.\n"
-            "After tool results are provided, decide whether another tool is needed or provide the final answer.\n\n"
+            "After tool execution, you will receive a message with role `tool_result` containing raw tool output.\n"
+            "When you receive `tool_result`, either return another JSON tool action or the final user response.\n"
+            "Do not hallucinate tool results.\n\n"
             "Available tools:\n"
             f"{tools_prompt_text()}\n\n"
             f"{self._memory_context_text()}"
@@ -220,7 +230,7 @@ class AssistantWithMemory:
         messages = [{"role": "system", "content": tool_prompt}] + list(self.memory["short_term"])
 
         for step_index in range(1, MAX_TOOL_STEPS + 1):
-            response = ollama.chat(model=self.model, messages=messages)
+            response = self._chat_with_role_fallback(messages)
             content = response["message"]["content"]
             messages.append({"role": "assistant", "content": content})
 
@@ -233,28 +243,54 @@ class AssistantWithMemory:
             if isinstance(self.memory.get("pending_action"), dict) or "Reply 'yes'" in tool_result:
                 return tool_result
 
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Tool execution result:\n"
-                        f"{tool_result}\n\n"
-                        "If more tools are required, return a JSON action. Otherwise give the final user response."
-                    ),
-                }
-            )
+            summarized_result = self.summarize_tool_result(parsed_action, tool_result)
+            messages.append({"role": "tool_result", "content": summarized_result})
 
-        final_response = ollama.chat(
-            model=self.model,
-            messages=messages
+        final_response = self._chat_with_role_fallback(
+            messages
             + [
                 {
                     "role": "user",
                     "content": "Return a final text response for the user now. Do not call any more tools.",
                 }
-            ],
+            ]
         )
         return final_response["message"]["content"]
+
+    def _chat_with_role_fallback(self, messages):
+        try:
+            return ollama.chat(model=self.model, messages=messages)
+        except Exception:
+            normalized = []
+            for msg in messages:
+                role = msg.get("role")
+                content = msg.get("content", "")
+                if role == "tool_result":
+                    normalized.append({"role": "user", "content": f"TOOL_RESULT:\n{content}"})
+                else:
+                    normalized.append(msg)
+            return ollama.chat(
+                model=self.model,
+                messages=normalized,
+            )
+
+    def summarize_tool_result(self, action_payload, result):
+        text = str(result or "")
+        max_chars = MAX_TOOL_RESULT_CHARS
+        action = str((action_payload or {}).get("action", "")).strip().lower()
+
+        # Keep high-signal slices for verbose command output.
+        if action == "run_command":
+            lines = text.splitlines()
+            if len(lines) > 120:
+                head = lines[:80]
+                tail = lines[-20:]
+                text = "\n".join(head + ["...[omitted lines]..."] + tail)
+
+        if len(text) <= max_chars:
+            return text
+
+        return text[:max_chars] + "\n...[truncated]..."
 
     def _next_task_id(self):
         max_id = 0
@@ -765,7 +801,7 @@ class AssistantWithMemory:
             return result
         if action_type == "system_command" and isinstance(payload, dict):
             command = str(payload.get("command", "")).strip()
-            result = run_terminal_command(command)
+            result = run_terminal_command(command, timeout_seconds=TOOL_TIMEOUT_SECONDS)
             plan_id = payload.get("plan_id")
             step_no = payload.get("step")
             if result.startswith("[exit 0]") and isinstance(plan_id, int) and isinstance(step_no, int):
@@ -929,7 +965,7 @@ class AssistantWithMemory:
             final_reply = self.execute_file_command(file_cmd)
         elif system_cmd:
             if system_cmd["action"] == "command":
-                final_reply = run_terminal_command(system_cmd.get("command", ""))
+                final_reply = run_terminal_command(system_cmd.get("command", ""), timeout_seconds=TOOL_TIMEOUT_SECONDS)
             elif system_cmd["action"] == "open_app":
                 final_reply = open_app(system_cmd.get("app_name", ""))
             else:

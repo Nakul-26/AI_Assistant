@@ -53,7 +53,7 @@ def run_python_code(code: str) -> str:
     )
 
 
-def run_terminal_command(command: str) -> str:
+def run_terminal_command(command: str, timeout_seconds: int = 20) -> str:
     cmd = (command or "").strip()
     if not cmd:
         return "No command provided."
@@ -86,7 +86,7 @@ def run_terminal_command(command: str) -> str:
             capture_output=True,
             text=True,
             cwd=os.getcwd(),
-            timeout=20,
+            timeout=max(1, int(timeout_seconds)),
             shell=False,
         )
         stdout = (result.stdout or "").strip()
