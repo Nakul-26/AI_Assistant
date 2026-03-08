@@ -1,8 +1,13 @@
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
+from urllib.parse import urlparse, urlunparse
 
 TOOLS = {
     "list_files": {
@@ -30,11 +35,28 @@ TOOLS = {
         "args": {"app": "string"},
         "required": ["app"],
     },
+    "web_search": {
+        "description": "Search the web for external information.",
+        "args": {"query": "string"},
+        "required": ["query"],
+    },
+    "workspace_search": {
+        "description": "Search local workspace files for relevant code/text snippets.",
+        "args": {"query": "string"},
+        "required": ["query"],
+    },
 }
 
 
-def tools_prompt_text() -> str:
-    return json.dumps(TOOLS, indent=2, ensure_ascii=False)
+def tools_prompt_text(selected_tools=None) -> str:
+    if not selected_tools:
+        return json.dumps(TOOLS, indent=2, ensure_ascii=False)
+
+    selected = set(selected_tools)
+    filtered = {name: schema for name, schema in TOOLS.items() if name in selected}
+    if not filtered:
+        filtered = TOOLS
+    return json.dumps(filtered, indent=2, ensure_ascii=False)
 
 
 def calculator(expression: str) -> str:
@@ -135,3 +157,281 @@ def open_app(app_name: str) -> str:
                 continue
 
     return f"Could not find or open app: {name}"
+
+
+def web_search(query: str, max_results: int = 5, timeout_seconds: int = 10) -> str:
+    q = (query or "").strip()
+    if not q:
+        return "No search query provided."
+
+    endpoint = "https://api.duckduckgo.com/"
+    params = urllib.parse.urlencode(
+        {
+            "q": q,
+            "format": "json",
+            "no_redirect": 1,
+            "no_html": 1,
+            "skip_disambig": 0,
+        }
+    )
+    url = f"{endpoint}?{params}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=max(1, int(timeout_seconds))) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    except urllib.error.URLError as e:
+        return f"Web search error: {e}"
+    except Exception as e:
+        return f"Web search error: {e}"
+
+    results = []
+
+    abstract_text = str(payload.get("AbstractText", "")).strip()
+    abstract_url = str(payload.get("AbstractURL", "")).strip()
+    heading = str(payload.get("Heading", "")).strip() or "DuckDuckGo instant answer"
+    if abstract_text:
+        results.append({"title": heading, "url": abstract_url, "snippet": abstract_text})
+
+    for item in payload.get("Results", []):
+        if len(results) >= max_results:
+            break
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("Text", "")).strip()
+        link = str(item.get("FirstURL", "")).strip()
+        if text:
+            results.append({"title": text[:100], "url": link, "snippet": text})
+
+    for item in payload.get("RelatedTopics", []):
+        if len(results) >= max_results:
+            break
+        if not isinstance(item, dict):
+            continue
+
+        nested = item.get("Topics")
+        if isinstance(nested, list):
+            for child in nested:
+                if len(results) >= max_results:
+                    break
+                if not isinstance(child, dict):
+                    continue
+                text = str(child.get("Text", "")).strip()
+                link = str(child.get("FirstURL", "")).strip()
+                if text:
+                    results.append({"title": text[:100], "url": link, "snippet": text})
+            continue
+
+        text = str(item.get("Text", "")).strip()
+        link = str(item.get("FirstURL", "")).strip()
+        if text:
+            results.append({"title": text[:100], "url": link, "snippet": text})
+
+    if not results:
+        return f'No web results found for "{q}".'
+
+    return json.dumps({"query": q, "results": results[:max_results]}, indent=2, ensure_ascii=False)
+
+
+def normalize_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(text)
+        cleaned = parsed._replace(query="", fragment="", netloc=parsed.netloc.lower())
+        return urlunparse(cleaned)
+    except Exception:
+        return text
+
+
+def dedupe_results(results):
+    if not isinstance(results, list):
+        return []
+
+    seen = set()
+    unique = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "") or item.get("href", "")).strip()
+        norm = normalize_url(url)
+        if norm:
+            if norm in seen:
+                continue
+            seen.add(norm)
+        unique.append(item)
+    return unique
+
+
+def format_web_results(raw_results, max_items: int = 5) -> str:
+    payload = raw_results
+
+    if isinstance(raw_results, str):
+        try:
+            payload = json.loads(raw_results)
+        except Exception:
+            return raw_results
+
+    if not isinstance(payload, dict):
+        return str(raw_results)
+
+    query = str(payload.get("query", "")).strip()
+    items = payload.get("results", [])
+    if not isinstance(items, list):
+        return str(raw_results)
+    items = dedupe_results(items)
+
+    lines = [
+        "WEB_SEARCH_RESULTS",
+        f"Query: {query}",
+        "",
+        "Sources may contain outdated or incorrect information. Use them as references, not facts.",
+        "",
+    ]
+
+    for i, item in enumerate(items[:max(1, int(max_items))], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip() or "Untitled result"
+        link = str(item.get("url", "") or item.get("href", "")).strip()
+        snippet = str(item.get("snippet", "") or item.get("body", "") or item.get("text", "")).strip()
+
+        lines.append(f"[{i}] {title}")
+        if link:
+            lines.append(link)
+        if snippet:
+            lines.append(snippet)
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+
+def _tokenize_query(text: str):
+    return [t for t in re.findall(r"[a-z0-9_]+", str(text or "").lower()) if len(t) >= 2]
+
+
+def _is_probably_text_file(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    text_exts = {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".java",
+        ".c",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".go",
+        ".rs",
+        ".rb",
+        ".php",
+        ".swift",
+        ".kt",
+        ".m",
+        ".mm",
+        ".scala",
+        ".sh",
+        ".ps1",
+        ".bat",
+        ".cmd",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".md",
+        ".txt",
+        ".html",
+        ".css",
+        ".sql",
+        ".xml",
+    }
+    return ext in text_exts
+
+
+def _best_snippet(content: str, query_tokens):
+    lines = (content or "").splitlines()
+    if not lines:
+        return ""
+    if not query_tokens:
+        return lines[0].strip()[:220]
+
+    for line in lines:
+        line_l = line.lower()
+        if any(tok in line_l for tok in query_tokens):
+            return line.strip()[:220]
+    return lines[0].strip()[:220]
+
+
+def workspace_search(query: str, workspace_root: str = "", max_results: int = 5) -> str:
+    q = str(query or "").strip()
+    if not q:
+        return "No workspace query provided."
+
+    root = str(workspace_root or "").strip()
+    if not root:
+        root = os.path.join(os.getcwd(), "workspace")
+
+    if not os.path.isdir(root):
+        return f"Workspace directory not found: {root}"
+
+    query_tokens = _tokenize_query(q)
+    if not query_tokens:
+        return "Workspace query did not contain searchable keywords."
+
+    skip_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache"}
+    max_file_bytes = 512 * 1024
+    matches = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if not _is_probably_text_file(path):
+                continue
+
+            try:
+                if os.path.getsize(path) > max_file_bytes:
+                    continue
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            content_l = content.lower()
+            token_hits = 0
+            frequency = 0
+            for token in query_tokens:
+                if token in content_l:
+                    token_hits += 1
+                    frequency += content_l.count(token)
+
+            if token_hits == 0:
+                continue
+
+            score = (token_hits / max(1, len(query_tokens))) + min(0.5, frequency / 50.0)
+            rel_path = os.path.relpath(path, root).replace("\\", "/")
+            snippet = _best_snippet(content, query_tokens)
+            matches.append({"path": rel_path, "score": score, "snippet": snippet})
+
+    if not matches:
+        return f'No workspace matches found for "{q}".'
+
+    matches.sort(key=lambda m: m["score"], reverse=True)
+    top = matches[: max(1, int(max_results))]
+
+    lines = ["WORKSPACE_MATCHES", f"Query: {q}", ""]
+    for i, item in enumerate(top, start=1):
+        lines.append(f"[{i}] {item['path']}")
+        lines.append(f"Score: {item['score']:.2f}")
+        if item["snippet"]:
+            lines.append(f"Snippet: {item['snippet']}")
+        lines.append("")
+
+    return "\n".join(lines).strip()

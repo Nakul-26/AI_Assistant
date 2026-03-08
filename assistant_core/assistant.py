@@ -16,7 +16,17 @@ from .config import (
     TOOL_TIMEOUT_SECONDS,
 )
 from .executor import AutonomousExecutor
-from .tools import TOOLS, calculator, open_app, run_python_code, run_terminal_command, tools_prompt_text
+from .tools import (
+    TOOLS,
+    calculator,
+    format_web_results,
+    open_app,
+    run_python_code,
+    run_terminal_command,
+    tools_prompt_text,
+    web_search,
+    workspace_search,
+)
 
 
 class AssistantWithMemory:
@@ -168,14 +178,17 @@ class AssistantWithMemory:
         response = self._chat_with_role_fallback(messages)
         return response["message"]["content"]
 
-    def parse_json_tool_action(self, response_text):
-        payload = self._extract_json_object(response_text)
+    def _validate_tool_action_payload(self, payload):
         if not isinstance(payload, dict):
             return None
 
         action = str(payload.get("action", "")).strip()
         args = payload.get("args", {})
-        if not action or not isinstance(args, dict):
+        if not action:
+            return None
+        if "args" not in payload:
+            args = {}
+        if not isinstance(args, dict):
             return None
 
         schema = TOOLS.get(action)
@@ -188,6 +201,32 @@ class AssistantWithMemory:
                 return None
 
         return {"action": action, "args": args}
+
+    def parse_json_tool_action(self, response_text):
+        payload = self._extract_json_object(response_text)
+        return self._validate_tool_action_payload(payload)
+
+    def parse_model_response_envelope(self, response_text):
+        payload = self._extract_json_object(response_text)
+        if not isinstance(payload, dict):
+            return None
+
+        response_type = str(payload.get("type", "")).strip().lower()
+        if response_type not in {"tool", "final"}:
+            return None
+        if "content" not in payload:
+            return None
+
+        content = payload.get("content")
+        if response_type == "final":
+            if isinstance(content, str):
+                return {"type": "final", "content": content}
+            return {"type": "final", "content": json.dumps(content, ensure_ascii=False)}
+
+        action_payload = self._validate_tool_action_payload(content)
+        if not action_payload:
+            return None
+        return {"type": "tool", "content": action_payload}
 
     def execute_json_tool_action(self, action_payload):
         action = action_payload["action"]
@@ -209,22 +248,85 @@ class AssistantWithMemory:
             return run_terminal_command(str(args.get("command", "")), timeout_seconds=TOOL_TIMEOUT_SECONDS)
         if action == "open_app":
             return open_app(str(args.get("app", "")))
+        if action == "web_search":
+            raw_results = web_search(str(args.get("query", "")))
+            return format_web_results(raw_results)
+        if action == "workspace_search":
+            return workspace_search(str(args.get("query", "")), workspace_root=str(self.workspace_dir))
 
         return f"Unsupported tool action: {action}"
 
+    def infer_relevant_tools(self, user_message):
+        text = str(user_message or "").lower()
+        tools = set()
+
+        if any(k in text for k in ["file", "workspace", "read", "write", "edit", "append", "delete", "list"]):
+            tools.update(["list_files", "read_file", "write_file"])
+
+        if "git" in text or "command" in text or "terminal" in text or "shell" in text:
+            tools.add("run_command")
+
+        if any(k in text for k in ["open", "launch", "start", "app"]):
+            tools.add("open_app")
+        if any(
+            k in text
+            for k in [
+                "search",
+                "web",
+                "internet",
+                "latest",
+                "current",
+                "today",
+                "news",
+                "docs",
+                "documentation",
+                "what is",
+                "how to",
+                "error",
+                "fix",
+                "stack overflow",
+            ]
+        ):
+            tools.add("web_search")
+        if any(
+            k in text
+            for k in [
+                "project",
+                "codebase",
+                "code",
+                "workspace",
+                "repository",
+                "repo",
+                "find in",
+                "where is",
+                "which file",
+                "explain this project",
+                "search workspace",
+            ]
+        ):
+            tools.add("workspace_search")
+
+        # Keep hints restricted to tools exposed in TOOLS.
+        return [name for name in TOOLS.keys() if name in tools]
+
     def ask_ai_with_json_tools(self, user_message=""):
+        hinted_tools = self.infer_relevant_tools(user_message)
+        tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()
         tool_prompt = (
             f"{SYSTEM_PROMPT}\n"
             "You are a local AI assistant that can use tools.\n"
-            "When a tool is needed, respond ONLY valid JSON in this exact shape:\n"
-            '{"action":"<tool_name>","args":{...}}\n'
-            "No markdown, no code fences.\n"
-            "If no tool is needed, respond with normal text.\n"
+            "When responding, you MUST return ONLY valid JSON in this exact shape:\n"
+            '{"type":"tool|final","content":...}\n'
+            "If a tool is needed, return:\n"
+            '{"type":"tool","content":{"action":"<tool_name>","args":{...}}}\n'
+            "If no tool is needed, return:\n"
+            '{"type":"final","content":"<final answer>"}\n'
+            "No markdown, no code fences, and no text outside the JSON.\n"
             "After tool execution, you will receive a message with role `tool_result` containing raw tool output.\n"
-            "When you receive `tool_result`, either return another JSON tool action or the final user response.\n"
+            "When you receive `tool_result`, return either another tool envelope or a final envelope.\n"
             "Do not hallucinate tool results.\n\n"
-            "Available tools:\n"
-            f"{tools_prompt_text()}\n\n"
+            "Relevant tools for this request:\n"
+            f"{tool_list_text}\n\n"
             f"{self._memory_context_text()}"
         )
         messages = [{"role": "system", "content": tool_prompt}] + list(self.memory["short_term"])
@@ -234,16 +336,25 @@ class AssistantWithMemory:
             content = response["message"]["content"]
             messages.append({"role": "assistant", "content": content})
 
-            parsed_action = self.parse_json_tool_action(content)
-            if not parsed_action:
+            envelope = self.parse_model_response_envelope(content)
+            if not envelope:
                 return content
 
-            tool_result = self.execute_json_tool_action(parsed_action)
-            self.add_tool_trace(user_message, step_index, parsed_action, tool_result)
+            if envelope["type"] == "final":
+                return envelope["content"]
+
+            action_payload = envelope["content"]
+            if "action" not in action_payload:
+                return "Invalid tool call from model."
+            if hinted_tools and action_payload["action"] not in hinted_tools:
+                print(f"[tool-warning] Model chose '{action_payload['action']}' outside hint set {hinted_tools}")
+
+            tool_result = self.execute_json_tool_action(action_payload)
+            self.add_tool_trace(user_message, step_index, action_payload, tool_result)
             if isinstance(self.memory.get("pending_action"), dict) or "Reply 'yes'" in tool_result:
                 return tool_result
 
-            summarized_result = self.summarize_tool_result(parsed_action, tool_result)
+            summarized_result = self.summarize_tool_result(action_payload, tool_result)
             messages.append({"role": "tool_result", "content": summarized_result})
 
         final_response = self._chat_with_role_fallback(
@@ -251,11 +362,19 @@ class AssistantWithMemory:
             + [
                 {
                     "role": "user",
-                    "content": "Return a final text response for the user now. Do not call any more tools.",
+                    "content": (
+                        "Return a final response now using ONLY this JSON envelope: "
+                        '{"type":"final","content":"..."} '
+                        "Do not call any more tools."
+                    ),
                 }
             ]
         )
-        return final_response["message"]["content"]
+        final_content = final_response["message"]["content"]
+        final_envelope = self.parse_model_response_envelope(final_content)
+        if final_envelope and final_envelope["type"] == "final":
+            return final_envelope["content"]
+        return final_content
 
     def _chat_with_role_fallback(self, messages):
         try:
