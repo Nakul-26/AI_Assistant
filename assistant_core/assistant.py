@@ -27,14 +27,17 @@ from .tools import (
     web_search,
     workspace_search,
 )
+from .workspace_index import build_workspace_map, format_workspace_overview
 
 
 class AssistantWithMemory:
     def __init__(self, model="mistral", memory_file=MEMORY_FILE):
         self.model = model
         self.memory_file = memory_file
+        self.repo_root = Path(os.getcwd()).resolve()
         self.workspace_dir = (Path(os.getcwd()) / "workspace").resolve()
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.workspace_map = build_workspace_map(self.repo_root)
         self.memory = self.load_memory()
         self.executor = AutonomousExecutor(self)
 
@@ -135,6 +138,89 @@ class AssistantWithMemory:
         if len(self.memory["tool_traces"]) > MAX_TOOL_TRACES:
             self.memory["tool_traces"] = self.memory["tool_traces"][-MAX_TOOL_TRACES:]
 
+    def _start_agent_trace(self, user_message):
+        self._active_trace = {
+            "user": str(user_message or "").strip(),
+            "plan": [],
+            "steps": [],
+            "context": [],
+            "final_response": "",
+        }
+
+    def _record_trace_plan(self, plan_steps):
+        if not isinstance(getattr(self, "_active_trace", None), dict):
+            return
+        self._active_trace["plan"] = list(plan_steps or [])
+
+    def _record_trace_step(self, step_no, description, tool_name="", args=None, result=""):
+        if not isinstance(getattr(self, "_active_trace", None), dict):
+            return
+        self._active_trace["steps"].append(
+            {
+                "step": step_no,
+                "description": str(description or "").strip(),
+                "tool": str(tool_name or "").strip(),
+                "args": args if isinstance(args, dict) else {},
+                "result": str(result or "").strip(),
+            }
+        )
+
+    def _record_trace_context(self, label, content):
+        if not isinstance(getattr(self, "_active_trace", None), dict):
+            return
+        self._active_trace["context"].append(
+            {
+                "label": str(label or "").strip(),
+                "content": str(content or "").strip(),
+            }
+        )
+
+    def _finalize_agent_trace(self, final_response):
+        trace = getattr(self, "_active_trace", None)
+        if not isinstance(trace, dict):
+            return
+
+        trace["final_response"] = str(final_response or "").strip()
+        print("\n=== AGENT TRACE ===")
+        print(f"User: {trace.get('user', '')}")
+
+        print("\n[PLANNER]")
+        plan_steps = trace.get("plan", [])
+        if plan_steps:
+            for step in plan_steps:
+                step_no = step.get("step", "?")
+                description = step.get("description", "")
+                tool_name = step.get("tool", "final")
+                args = step.get("args", {})
+                print(f"{step_no}. {description} [{tool_name}] {json.dumps(args, ensure_ascii=False)}")
+        else:
+            print("(no plan)")
+
+        print("\n[EXECUTOR]")
+        executed_steps = trace.get("steps", [])
+        if executed_steps:
+            for step in executed_steps:
+                step_no = step.get("step", "?")
+                description = step.get("description", "")
+                tool_name = step.get("tool", "final")
+                args = json.dumps(step.get("args", {}), ensure_ascii=False)
+                print(f"STEP {step_no}  {tool_name}  {description}  {args}")
+        else:
+            print("(no executed steps)")
+
+        print("\n[CONTEXT]")
+        contexts = trace.get("context", [])
+        if contexts:
+            for item in contexts:
+                print(f"{item.get('label', 'context')}: {item.get('content', '')}")
+        else:
+            print("(no collected context)")
+
+        print("\n[FINAL RESPONSE]")
+        print(trace.get("final_response", ""))
+        print("\n=== TRACE END ===")
+        self._active_trace = None
+
     def extract_long_term_memory(self, user_message):
         msg = user_message.strip()
         msg_lower = msg.lower()
@@ -228,6 +314,45 @@ class AssistantWithMemory:
             return None
         return {"type": "tool", "content": action_payload}
 
+    def parse_execution_plan(self, response_text):
+        payload = self._extract_json_object(response_text)
+        if not isinstance(payload, dict):
+            return None
+
+        raw_steps = payload.get("steps")
+        if not isinstance(raw_steps, list):
+            return None
+
+        plan_steps = []
+        for index, raw_step in enumerate(raw_steps, start=1):
+            if isinstance(raw_step, dict):
+                description = str(raw_step.get("description") or raw_step.get("step") or "").strip()
+                tool_name = str(raw_step.get("tool", "")).strip()
+                args = raw_step.get("args", {})
+            else:
+                description = str(raw_step).strip()
+                tool_name = ""
+                args = {}
+
+            if not description:
+                continue
+
+            if tool_name and tool_name not in TOOLS and tool_name != "final":
+                tool_name = ""
+            if not isinstance(args, dict):
+                args = {}
+
+            plan_steps.append(
+                {
+                    "step": index,
+                    "description": description,
+                    "tool": tool_name,
+                    "args": args,
+                }
+            )
+
+        return plan_steps or None
+
     def execute_json_tool_action(self, action_payload):
         action = action_payload["action"]
         args = action_payload.get("args", {})
@@ -309,12 +434,182 @@ class AssistantWithMemory:
         # Keep hints restricted to tools exposed in TOOLS.
         return [name for name in TOOLS.keys() if name in tools]
 
+    def generate_execution_plan(self, user_message="", hinted_tools=None):
+        tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()
+        workspace_overview = format_workspace_overview(self.workspace_map, query=user_message, limit=20)
+        planner_prompt = (
+            f"{SYSTEM_PROMPT}\n"
+            "You are the planner for a local AI assistant.\n"
+            "Break the user request into a short execution plan before any tool call happens.\n"
+            "Choose the best tool for each step when a tool is helpful.\n"
+            "Use only these tool names when needed: "
+            f"{', '.join(TOOLS.keys())}.\n"
+            "Use tool \"final\" for a step that should answer directly without a tool.\n"
+            "Keep the plan minimal: 1 to 4 steps.\n"
+            "Return ONLY valid JSON with this schema:\n"
+            '{"steps":[{"step":1,"description":"...","tool":"tool_name|final","args":{"path":"optional","query":"optional"}}]}\n'
+            "Example:\n"
+            '{"steps":['
+            '{"step":1,"description":"Inspect assistant_core/assistant.py","tool":"read_file","args":{"path":"assistant_core/assistant.py"}},'
+            '{"step":2,"description":"Inspect assistant_core/tools.py","tool":"read_file","args":{"path":"assistant_core/tools.py"}},'
+            '{"step":3,"description":"Summarize the architecture","tool":"final","args":{}}'
+            "]}\n"
+            "No markdown. No commentary.\n\n"
+            "Workspace overview:\n"
+            f"{workspace_overview}\n\n"
+            "Available tools:\n"
+            f"{tool_list_text}\n\n"
+            f"{self._memory_context_text()}\n\n"
+            f"User request: {user_message}"
+        )
+        response_text = ""
+        try:
+            response = self._chat_with_role_fallback([{"role": "system", "content": planner_prompt}])
+            response_text = response["message"]["content"]
+            print("\n[PLANNER RAW RESPONSE]")
+            print(response_text)
+            parsed = self.parse_execution_plan(response_text)
+            print("\n[PLANNER PARSE RESULT]")
+            print(parsed)
+            if parsed:
+                return parsed
+        except Exception:
+            print("\n[PLANNER RAW RESPONSE]")
+            print(response_text or "(planner call failed before content was returned)")
+            print("\n[PLANNER PARSE RESULT]")
+            print(None)
+
+        heuristic_plan = self._heuristic_execution_plan(user_message, hinted_tools=hinted_tools)
+        print("\n[PLANNER FALLBACK USED]")
+        print(heuristic_plan)
+        self._record_trace_plan(heuristic_plan)
+        return heuristic_plan
+
+    def generate_plan(self, user_message="", hinted_tools=None):
+        return self.generate_execution_plan(user_message=user_message, hinted_tools=hinted_tools)
+
+    def _heuristic_execution_plan(self, user_message="", hinted_tools=None):
+        msg = str(user_message or "").strip()
+        msg_lower = msg.lower()
+
+        assistant_path = self._workspace_map_path("assistant.py")
+        tools_path = self._workspace_map_path("tools.py")
+        config_path = self._workspace_map_path("config.py")
+
+        if "explain" in msg_lower and any(token in msg_lower for token in ["project", "repo", "codebase"]):
+            steps = []
+            if assistant_path:
+                steps.append(self._plan_step("Inspect the main agent logic", "read_file", path=assistant_path))
+            if tools_path:
+                steps.append(self._plan_step("Inspect the tool implementations", "read_file", path=tools_path))
+            steps.append(self._plan_step("Summarize the project architecture", "final"))
+            return self._normalize_plan_steps(steps)
+
+        if "tool hint" in msg_lower or "tool selection" in msg_lower:
+            steps = []
+            if assistant_path:
+                steps.append(self._plan_step("Inspect tool hinting and tool selection logic", "read_file", path=assistant_path))
+            if tools_path:
+                steps.append(self._plan_step("Inspect tool definitions", "read_file", path=tools_path))
+            steps.append(self._plan_step("Explain which file controls tool selection", "final"))
+            return self._normalize_plan_steps(steps)
+
+        if "which file" in msg_lower and "tool" in msg_lower:
+            steps = []
+            if assistant_path:
+                steps.append(self._plan_step("Inspect assistant_core/assistant.py for dispatch and hinting", "read_file", path=assistant_path))
+            if tools_path:
+                steps.append(self._plan_step("Inspect tool definitions in tools.py", "read_file", path=tools_path))
+            steps.append(self._plan_step("Name the controlling file and relevant function", "final"))
+            return self._normalize_plan_steps(steps)
+
+        if "py_compile" in msg_lower:
+            steps = []
+            if config_path:
+                steps.append(self._plan_step("Inspect runtime configuration", "read_file", path=config_path))
+            if assistant_path:
+                steps.append(self._plan_step("Inspect assistant execution paths that reference py_compile", "read_file", path=assistant_path))
+            steps.append(self._plan_step("Search the workspace for py_compile references", "workspace_search", query="py_compile"))
+            steps.append(self._plan_step("Explain the likely cause of the py_compile failure", "final"))
+            return self._normalize_plan_steps(steps)
+
+        if "find where" in msg_lower or "where is" in msg_lower or "where" in msg_lower:
+            if "tool" in msg_lower:
+                steps = [
+                    self._plan_step("Search the workspace for tool-related logic", "workspace_search", query=msg),
+                ]
+                if assistant_path:
+                    steps.append(self._plan_step("Inspect assistant_core/assistant.py", "read_file", path=assistant_path))
+                steps.append(self._plan_step("Explain where the relevant logic lives", "final"))
+                return self._normalize_plan_steps(steps)
+
+        fallback_tool = "final"
+        fallback_args = {}
+        if hinted_tools:
+            fallback_tool = hinted_tools[0]
+            if fallback_tool == "workspace_search":
+                fallback_args = {"query": msg}
+        return self._normalize_plan_steps([self._plan_step(msg or "Respond to the user.", fallback_tool, **fallback_args)])
+
+    def _workspace_map_path(self, filename):
+        target = str(filename or "").strip().lower()
+        exact_matches = []
+        suffix_matches = []
+        for entry in self.workspace_map:
+            path_text = str(entry.get("path", ""))
+            path_lower = path_text.lower()
+            if Path(path_text).name.lower() == target:
+                exact_matches.append(path_text)
+            elif path_lower.endswith("/" + target):
+                suffix_matches.append(path_text)
+        prioritized = sorted(exact_matches, key=lambda value: (0 if value.startswith("assistant_core/") else 1, value))
+        if prioritized:
+            return prioritized[0]
+        prioritized = sorted(suffix_matches, key=lambda value: (0 if value.startswith("assistant_core/") else 1, value))
+        if prioritized:
+            return prioritized[0]
+        return ""
+
+    def _plan_step(self, description, tool, **args):
+        clean_args = {key: value for key, value in args.items() if isinstance(value, str) and value.strip()}
+        return {
+            "description": str(description or "").strip(),
+            "tool": str(tool or "").strip(),
+            "args": clean_args,
+        }
+
+    def _normalize_plan_steps(self, steps):
+        normalized = []
+        for index, step in enumerate(steps, start=1):
+            description = str(step.get("description", "")).strip()
+            tool = str(step.get("tool", "")).strip() or "final"
+            args = step.get("args", {})
+            if not description:
+                continue
+            if tool not in TOOLS and tool != "final":
+                tool = "final"
+            if not isinstance(args, dict):
+                args = {}
+            normalized.append(
+                {
+                    "step": index,
+                    "description": description,
+                    "tool": tool,
+                    "args": args,
+                }
+            )
+        return normalized or [{"step": 1, "description": "Respond to the user.", "tool": "final", "args": {}}]
+
     def ask_ai_with_json_tools(self, user_message=""):
         hinted_tools = self.infer_relevant_tools(user_message)
+        execution_plan = self.generate_plan(user_message=user_message, hinted_tools=hinted_tools)
+        self._record_trace_plan(execution_plan)
         tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()
+        plan_text = json.dumps(execution_plan, indent=2, ensure_ascii=False)
         tool_prompt = (
             f"{SYSTEM_PROMPT}\n"
-            "You are a local AI assistant that can use tools.\n"
+            "You are the executor for a local AI assistant.\n"
+            "A planner has already created the execution plan. Execute one planned step at a time.\n"
             "When responding, you MUST return ONLY valid JSON in this exact shape:\n"
             '{"type":"tool|final","content":...}\n'
             "If a tool is needed, return:\n"
@@ -323,15 +618,30 @@ class AssistantWithMemory:
             '{"type":"final","content":"<final answer>"}\n'
             "No markdown, no code fences, and no text outside the JSON.\n"
             "After tool execution, you will receive a message with role `tool_result` containing raw tool output.\n"
-            "When you receive `tool_result`, return either another tool envelope or a final envelope.\n"
+            "Use prior completed step results when handling later steps.\n"
+            "Prefer the tool selected by the planner for the current step.\n"
             "Do not hallucinate tool results.\n\n"
             "Relevant tools for this request:\n"
             f"{tool_list_text}\n\n"
+            "Planner output:\n"
+            f"{plan_text}\n\n"
             f"{self._memory_context_text()}"
         )
         messages = [{"role": "system", "content": tool_prompt}] + list(self.memory["short_term"])
+        completed_steps = []
 
-        for step_index in range(1, MAX_TOOL_STEPS + 1):
+        for plan_step in execution_plan[:MAX_TOOL_STEPS]:
+            step_index = plan_step.get("step")
+            step_description = plan_step.get("description", "")
+            expected_tool = plan_step.get("tool", "")
+            expected_args = plan_step.get("args", {})
+            step_prompt = (
+                f"Execute planned step {step_index}: {step_description}\n"
+                f"Preferred tool: {expected_tool or 'final'}\n"
+                f"Suggested args: {json.dumps(expected_args, ensure_ascii=False)}\n"
+                f"Completed step results so far:\n{json.dumps(completed_steps, indent=2, ensure_ascii=False)}"
+            )
+            messages.append({"role": "user", "content": step_prompt})
             response = self._chat_with_role_fallback(messages)
             content = response["message"]["content"]
             messages.append({"role": "assistant", "content": content})
@@ -341,6 +651,7 @@ class AssistantWithMemory:
                 return content
 
             if envelope["type"] == "final":
+                self._record_trace_step(step_index, step_description, "final", expected_args, envelope["content"])
                 return envelope["content"]
 
             action_payload = envelope["content"]
@@ -351,11 +662,30 @@ class AssistantWithMemory:
 
             tool_result = self.execute_json_tool_action(action_payload)
             self.add_tool_trace(user_message, step_index, action_payload, tool_result)
+            self._record_trace_step(
+                step_index,
+                step_description,
+                action_payload.get("action"),
+                action_payload.get("args", {}),
+                self.summarize_tool_result(action_payload, tool_result),
+            )
+            if action_payload.get("action") == "read_file":
+                self._record_trace_context(action_payload.get("args", {}).get("path", "read_file"), self.summarize_tool_result(action_payload, tool_result))
+            elif action_payload.get("action") == "workspace_search":
+                self._record_trace_context("workspace_search", self.summarize_tool_result(action_payload, tool_result))
             if isinstance(self.memory.get("pending_action"), dict) or "Reply 'yes'" in tool_result:
                 return tool_result
 
             summarized_result = self.summarize_tool_result(action_payload, tool_result)
             messages.append({"role": "tool_result", "content": summarized_result})
+            completed_steps.append(
+                {
+                    "step": step_index,
+                    "description": step_description,
+                    "tool": action_payload.get("action"),
+                    "result": summarized_result,
+                }
+            )
 
         final_response = self._chat_with_role_fallback(
             messages
@@ -363,7 +693,7 @@ class AssistantWithMemory:
                 {
                     "role": "user",
                     "content": (
-                        "Return a final response now using ONLY this JSON envelope: "
+                        "The planned steps are complete. Return a final response now using ONLY this JSON envelope: "
                         '{"type":"final","content":"..."} '
                         "Do not call any more tools."
                     ),
@@ -1006,6 +1336,7 @@ class AssistantWithMemory:
             return f"File operation error: {e}"
 
     def process_request(self, user_message):
+        self._start_agent_trace(user_message)
         self.extract_long_term_memory(user_message)
         self.add_to_short_term("user", user_message)
         self.sync_plan_step_statuses_from_tasks()
@@ -1015,16 +1346,19 @@ class AssistantWithMemory:
             if self._is_confirmation(user_message):
                 final_reply = self._execute_pending_action() or "No pending action to confirm."
                 self.add_to_short_term("assistant", final_reply)
+                self._finalize_agent_trace(final_reply)
                 self.save_memory()
                 return final_reply
             if self._is_rejection(user_message):
                 self._clear_pending_action()
                 final_reply = "Cancelled pending action."
                 self.add_to_short_term("assistant", final_reply)
+                self._finalize_agent_trace(final_reply)
                 self.save_memory()
                 return final_reply
             final_reply = "A confirmation is pending. Reply 'yes' to proceed or 'no' to cancel."
             self.add_to_short_term("assistant", final_reply)
+            self._finalize_agent_trace(final_reply)
             self.save_memory()
             return final_reply
 
@@ -1098,5 +1432,6 @@ class AssistantWithMemory:
             final_reply = self.ask_ai_with_json_tools(user_message=user_message)
 
         self.add_to_short_term("assistant", final_reply)
+        self._finalize_agent_trace(final_reply)
         self.save_memory()
         return final_reply
