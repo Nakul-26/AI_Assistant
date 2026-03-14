@@ -4,6 +4,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -44,6 +45,11 @@ TOOLS = {
         "description": "Search local workspace files for relevant code/text snippets.",
         "args": {"query": "string"},
         "required": ["query"],
+    },
+    "capture_screen": {
+        "description": "Capture the current desktop screen and save an image.",
+        "args": {},
+        "required": [],
     },
 }
 
@@ -157,6 +163,50 @@ def open_app(app_name: str) -> str:
                 continue
 
     return f"Could not find or open app: {name}"
+
+
+def capture_screen(output_dir: str = "screenshots"):
+    try:
+        from PIL import Image, ImageGrab
+    except Exception as e:
+        return f"Screen capture unavailable: Pillow is not installed ({e})."
+
+    target_dir = os.path.abspath(output_dir or "screenshots")
+    os.makedirs(target_dir, exist_ok=True)
+
+    ts = int(time.time())
+    image_path = os.path.join(target_dir, f"screen_{ts}.png")
+
+    try:
+        import mss
+    except Exception:
+        mss = None
+
+    try:
+        if mss is not None:
+            with mss.mss() as sct:
+                monitors = getattr(sct, "monitors", [])
+                if len(monitors) < 2:
+                    return "Screen capture unavailable: no primary monitor detected."
+
+                monitor = monitors[1]
+                shot = sct.grab(monitor)
+                image = Image.frombytes("RGB", shot.size, shot.rgb)
+                image.save(image_path)
+                width, height = shot.size
+        else:
+            image = ImageGrab.grab()
+            image.save(image_path)
+            width, height = image.size
+    except Exception as e:
+        return f"Screen capture error: {e}"
+
+    return {
+        "image_path": os.path.relpath(image_path, os.getcwd()).replace("\\", "/"),
+        "width": int(width),
+        "height": int(height),
+        "timestamp": ts,
+    }
 
 
 def web_search(query: str, max_results: int = 5, timeout_seconds: int = 10) -> str:

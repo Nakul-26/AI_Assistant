@@ -19,6 +19,7 @@ from .executor import AutonomousExecutor
 from .tools import (
     TOOLS,
     calculator,
+    capture_screen,
     format_web_results,
     open_app,
     run_python_code,
@@ -378,6 +379,8 @@ class AssistantWithMemory:
             return format_web_results(raw_results)
         if action == "workspace_search":
             return workspace_search(str(args.get("query", "")), workspace_root=str(self.workspace_dir))
+        if action == "capture_screen":
+            return capture_screen()
 
         return f"Unsupported tool action: {action}"
 
@@ -393,6 +396,18 @@ class AssistantWithMemory:
 
         if any(k in text for k in ["open", "launch", "start", "app"]):
             tools.add("open_app")
+        if any(
+            k in text
+            for k in [
+                "capture screen",
+                "screen capture",
+                "screenshot",
+                "screen",
+                "desktop",
+                "display",
+            ]
+        ):
+            tools.add("capture_screen")
         if any(
             k in text
             for k in [
@@ -673,6 +688,8 @@ class AssistantWithMemory:
                 self._record_trace_context(action_payload.get("args", {}).get("path", "read_file"), self.summarize_tool_result(action_payload, tool_result))
             elif action_payload.get("action") == "workspace_search":
                 self._record_trace_context("workspace_search", self.summarize_tool_result(action_payload, tool_result))
+            elif action_payload.get("action") == "capture_screen":
+                self._record_trace_context("capture_screen", self.summarize_tool_result(action_payload, tool_result))
             if isinstance(self.memory.get("pending_action"), dict) or "Reply 'yes'" in tool_result:
                 return tool_result
 
@@ -724,7 +741,10 @@ class AssistantWithMemory:
             )
 
     def summarize_tool_result(self, action_payload, result):
-        text = str(result or "")
+        if isinstance(result, (dict, list)):
+            text = json.dumps(result, indent=2, ensure_ascii=False)
+        else:
+            text = str(result or "")
         max_chars = MAX_TOOL_RESULT_CHARS
         action = str((action_payload or {}).get("action", "")).strip().lower()
 
@@ -735,6 +755,25 @@ class AssistantWithMemory:
                 head = lines[:80]
                 tail = lines[-20:]
                 text = "\n".join(head + ["...[omitted lines]..."] + tail)
+        elif action == "capture_screen":
+            try:
+                payload = result if isinstance(result, dict) else json.loads(text)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                image_path = str(payload.get("image_path", "")).strip()
+                width = payload.get("width")
+                height = payload.get("height")
+                timestamp = payload.get("timestamp")
+                details = []
+                if image_path:
+                    details.append(f"image_path: {image_path}")
+                if width and height:
+                    details.append(f"resolution: {width}x{height}")
+                if timestamp:
+                    details.append(f"timestamp: {timestamp}")
+                if details:
+                    text = "\n".join(details)
 
         if len(text) <= max_chars:
             return text
@@ -1088,6 +1127,26 @@ class AssistantWithMemory:
 
         return None
 
+    def extract_screen_command(self, user_message):
+        msg = str(user_message or "").strip().lower()
+        if not msg:
+            return None
+
+        exact_phrases = {
+            "capture screen",
+            "capture the screen",
+            "capture my screen",
+            "take screenshot",
+            "take a screenshot",
+            "take screen shot",
+            "take a screen shot",
+            "screenshot",
+            "screen capture",
+        }
+        if msg in exact_phrases:
+            return {"action": "capture_screen"}
+        return None
+
     def _clean_path_token(self, path_text):
         path = (path_text or "").strip().strip("'\"`")
         # Allow natural-language separators like "file - C:\\a\\b.txt" or "file: C:\\a\\b.txt".
@@ -1367,6 +1426,7 @@ class AssistantWithMemory:
         task_cmd = self.extract_task_command(user_message)
         file_cmd = self.extract_file_command(user_message)
         system_cmd = self.extract_system_command(user_message)
+        screen_cmd = self.extract_screen_command(user_message)
         expression = self.extract_math_expression(user_message)
         code = self.extract_python_code(user_message)
 
@@ -1423,6 +1483,21 @@ class AssistantWithMemory:
                 final_reply = open_app(system_cmd.get("app_name", ""))
             else:
                 final_reply = "I could not process that system command."
+        elif screen_cmd:
+            action_payload = {"action": "capture_screen", "args": {}}
+            tool_result = self.execute_json_tool_action(action_payload)
+            self.add_tool_trace(user_message, 1, action_payload, tool_result)
+            summary = self.summarize_tool_result(action_payload, tool_result)
+            self._record_trace_plan([{"step": 1, "description": "Capture the current screen", "tool": "capture_screen", "args": {}}])
+            self._record_trace_step(1, "Capture the current screen", "capture_screen", {}, summary)
+            self._record_trace_context("capture_screen", summary)
+            if isinstance(tool_result, dict):
+                final_reply = (
+                    f"Captured screen to {tool_result.get('image_path', 'screenshots')} "
+                    f"({tool_result.get('width', '?')}x{tool_result.get('height', '?')})."
+                )
+            else:
+                final_reply = str(tool_result)
         elif expression:
             result = calculator(expression)
             final_reply = f"Result: {result}"
