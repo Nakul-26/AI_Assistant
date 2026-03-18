@@ -61,7 +61,7 @@ class AssistantWithMemory:
 
             if isinstance(data, list):
                 return {
-                    "short_term": data[-MAX_SHORT_TERM_MESSAGES:],
+                    "short_term": self._normalize_short_term_messages(data)[-MAX_SHORT_TERM_MESSAGES:],
                     "long_term": {},
                     "tasks": [],
                     "plans": [],
@@ -70,14 +70,12 @@ class AssistantWithMemory:
                 }
 
             if isinstance(data, dict):
-                short_term = data.get("short_term", [])
+                short_term = self._normalize_short_term_messages(data.get("short_term", []))
                 long_term = data.get("long_term", {})
                 tasks = data.get("tasks", [])
                 plans = data.get("plans", [])
                 pending_action = data.get("pending_action")
                 tool_traces = data.get("tool_traces", [])
-                if not isinstance(short_term, list):
-                    short_term = []
                 if not isinstance(long_term, dict):
                     long_term = {}
                 if not isinstance(tasks, list):
@@ -122,8 +120,37 @@ class AssistantWithMemory:
         except Exception as e:
             print(f"[Memory Save Error] {e}")
 
+    def _stringify_message_content(self, content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, (dict, list)):
+            try:
+                return json.dumps(content, ensure_ascii=False)
+            except Exception:
+                return str(content)
+        return str(content or "")
+
+    def _normalize_short_term_messages(self, messages):
+        if not isinstance(messages, list):
+            return []
+
+        normalized = []
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip()
+            if not role:
+                continue
+            normalized.append(
+                {
+                    "role": role,
+                    "content": self._stringify_message_content(item.get("content", "")),
+                }
+            )
+        return normalized
+
     def add_to_short_term(self, role, content):
-        self.memory["short_term"].append({"role": role, "content": content})
+        self.memory["short_term"].append({"role": role, "content": self._stringify_message_content(content)})
         if len(self.memory["short_term"]) > MAX_SHORT_TERM_MESSAGES:
             self.memory["short_term"] = self.memory["short_term"][-MAX_SHORT_TERM_MESSAGES:]
 
@@ -178,6 +205,13 @@ class AssistantWithMemory:
                 "content": str(content or "").strip(),
             }
         )
+
+    def _summarize_debug_text(self, text, max_chars=240):
+        value = str(text or "").strip().replace("\r", " ").replace("\n", " ")
+        value = re.sub(r"\s+", " ", value)
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars] + "..."
 
     def _finalize_agent_trace(self, final_response):
         trace = getattr(self, "_active_trace", None)
@@ -506,16 +540,16 @@ class AssistantWithMemory:
         try:
             response = self._chat_with_role_fallback([{"role": "system", "content": planner_prompt}])
             response_text = response["message"]["content"]
-            print("\n[PLANNER RAW RESPONSE]")
-            print(response_text)
             parsed = self.parse_execution_plan(response_text)
-            print("\n[PLANNER PARSE RESULT]")
-            print(parsed)
             if parsed:
                 return parsed
+            print("\n[PLANNER RAW RESPONSE SUMMARY]")
+            print(self._summarize_debug_text(response_text))
+            print("\n[PLANNER PARSE RESULT]")
+            print(None)
         except Exception:
-            print("\n[PLANNER RAW RESPONSE]")
-            print(response_text or "(planner call failed before content was returned)")
+            print("\n[PLANNER RAW RESPONSE SUMMARY]")
+            print(self._summarize_debug_text(response_text or "(planner call failed before content was returned)"))
             print("\n[PLANNER PARSE RESULT]")
             print(None)
 
