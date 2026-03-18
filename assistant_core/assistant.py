@@ -17,13 +17,16 @@ from .config import (
 )
 from .executor import AutonomousExecutor
 from .tools import (
+    SENSITIVE_TOOLS,
     TOOLS,
     calculator,
     capture_screen,
+    click_screen,
     format_web_results,
     open_app,
     run_python_code,
     run_terminal_command,
+    type_text,
     tools_prompt_text,
     web_search,
     workspace_search,
@@ -283,9 +286,16 @@ class AssistantWithMemory:
             return None
 
         for key in schema.get("required", []):
-            value = args.get(key)
-            if not isinstance(value, str) or not value.strip():
+            if key not in args:
                 return None
+            value = args.get(key)
+            expected_type = schema.get("args", {}).get(key)
+            if expected_type == "string":
+                if not isinstance(value, str) or not value.strip():
+                    return None
+            elif expected_type == "integer":
+                if not isinstance(value, int):
+                    return None
 
         return {"action": action, "args": args}
 
@@ -381,6 +391,21 @@ class AssistantWithMemory:
             return workspace_search(str(args.get("query", "")), workspace_root=str(self.workspace_dir))
         if action == "capture_screen":
             return capture_screen()
+        if action == "click":
+            if not bool(args.get("confirmed")):
+                pending_payload = {"action": action, "args": {"x": args.get("x"), "y": args.get("y"), "confirmed": True}}
+                self._set_pending_action("tool_action", pending_payload)
+                return f"AI wants to click at ({args.get('x')}, {args.get('y')}). Reply 'yes' to confirm or 'no' to cancel."
+            return click_screen(args.get("x"), args.get("y"))
+        if action == "type_text":
+            if not bool(args.get("confirmed")):
+                pending_payload = {"action": action, "args": {"text": args.get("text", ""), "confirmed": True}}
+                self._set_pending_action("tool_action", pending_payload)
+                return (
+                    f"AI wants to type {len(str(args.get('text', '')))} characters into the focused window. "
+                    "Reply 'yes' to confirm or 'no' to cancel."
+                )
+            return type_text(str(args.get("text", "")))
 
         return f"Unsupported tool action: {action}"
 
@@ -447,7 +472,7 @@ class AssistantWithMemory:
             tools.add("workspace_search")
 
         # Keep hints restricted to tools exposed in TOOLS.
-        return [name for name in TOOLS.keys() if name in tools]
+        return [name for name in TOOLS.keys() if name in tools and name not in SENSITIVE_TOOLS]
 
     def generate_execution_plan(self, user_message="", hinted_tools=None):
         tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()
@@ -458,7 +483,7 @@ class AssistantWithMemory:
             "Break the user request into a short execution plan before any tool call happens.\n"
             "Choose the best tool for each step when a tool is helpful.\n"
             "Use only these tool names when needed: "
-            f"{', '.join(TOOLS.keys())}.\n"
+            f"{', '.join(name for name in TOOLS.keys() if name not in SENSITIVE_TOOLS)}.\n"
             "Use tool \"final\" for a step that should answer directly without a tool.\n"
             "Keep the plan minimal: 1 to 4 steps.\n"
             "Return ONLY valid JSON with this schema:\n"
@@ -601,7 +626,7 @@ class AssistantWithMemory:
             args = step.get("args", {})
             if not description:
                 continue
-            if tool not in TOOLS and tool != "final":
+            if (tool not in TOOLS or tool in SENSITIVE_TOOLS) and tool != "final":
                 tool = "final"
             if not isinstance(args, dict):
                 args = {}
@@ -672,6 +697,8 @@ class AssistantWithMemory:
             action_payload = envelope["content"]
             if "action" not in action_payload:
                 return "Invalid tool call from model."
+            if action_payload["action"] in SENSITIVE_TOOLS:
+                return f"Sensitive tool '{action_payload['action']}' is manual-only and not available to the planner."
             if hinted_tools and action_payload["action"] not in hinted_tools:
                 print(f"[tool-warning] Model chose '{action_payload['action']}' outside hint set {hinted_tools}")
 
@@ -774,6 +801,20 @@ class AssistantWithMemory:
                     details.append(f"timestamp: {timestamp}")
                 if details:
                     text = "\n".join(details)
+        elif action == "click":
+            try:
+                payload = result if isinstance(result, dict) else json.loads(text)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                text = f"clicked: ({payload.get('x', '?')}, {payload.get('y', '?')})"
+        elif action == "type_text":
+            try:
+                payload = result if isinstance(result, dict) else json.loads(text)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                text = f"typed_text_length: {payload.get('text_length', '?')}"
 
         if len(text) <= max_chars:
             return text
@@ -1147,6 +1188,37 @@ class AssistantWithMemory:
             return {"action": "capture_screen"}
         return None
 
+    def extract_input_command(self, user_message):
+        msg = str(user_message or "").strip()
+        if not msg:
+            return None
+
+        click_match = re.match(r"^\s*click\s+(-?\d+)\s+(-?\d+)\s*$", msg, re.IGNORECASE)
+        if click_match:
+            return {
+                "action": "click",
+                "args": {"x": int(click_match.group(1)), "y": int(click_match.group(2))},
+                "description": f"Click at screen coordinate ({int(click_match.group(1))}, {int(click_match.group(2))})",
+            }
+
+        type_match = re.match(r"^\s*type(?:\s+text)?\s*:\s*([\s\S]+)$", msg, re.IGNORECASE)
+        if type_match:
+            return {
+                "action": "type_text",
+                "args": {"text": type_match.group(1)},
+                "description": "Type text into the focused application",
+            }
+
+        type_match = re.match(r"^\s*type(?:\s+text)?\s+([\s\S]+)$", msg, re.IGNORECASE)
+        if type_match:
+            return {
+                "action": "type_text",
+                "args": {"text": type_match.group(1)},
+                "description": "Type text into the focused application",
+            }
+
+        return None
+
     def _clean_path_token(self, path_text):
         path = (path_text or "").strip().strip("'\"`")
         # Allow natural-language separators like "file - C:\\a\\b.txt" or "file: C:\\a\\b.txt".
@@ -1317,6 +1389,10 @@ class AssistantWithMemory:
                     result += f"\nAutonomy: marked Plan #{plan_id} Step {step_no} as completed."
             self._clear_pending_action()
             return result
+        if action_type == "tool_action" and isinstance(payload, dict):
+            result = self.execute_json_tool_action(payload)
+            self._clear_pending_action()
+            return result
         self._clear_pending_action()
         return "Pending action was invalid and has been cleared."
 
@@ -1404,6 +1480,22 @@ class AssistantWithMemory:
         if isinstance(pending, dict):
             if self._is_confirmation(user_message):
                 final_reply = self._execute_pending_action() or "No pending action to confirm."
+                if pending.get("type") == "tool_action" and isinstance(pending.get("payload"), dict):
+                    action_payload = pending.get("payload")
+                    action_name = action_payload.get("action", "tool_action")
+                    action_args = action_payload.get("args", {})
+                    if isinstance(action_args, dict) and "confirmed" in action_args:
+                        action_args = {k: v for k, v in action_args.items() if k != "confirmed"}
+                    summary = self.summarize_tool_result(action_payload, final_reply)
+                    description = "Execute confirmed input action"
+                    if action_name == "click":
+                        description = f"Click at screen coordinate ({action_args.get('x', '?')}, {action_args.get('y', '?')})"
+                    elif action_name == "type_text":
+                        description = "Type text into the focused application"
+                    self.add_tool_trace("confirmed pending action", 1, action_payload, final_reply)
+                    self._record_trace_plan([{"step": 1, "description": description, "tool": action_name, "args": action_args}])
+                    self._record_trace_step(1, description, action_name, action_args, summary)
+                    self._record_trace_context(action_name, summary)
                 self.add_to_short_term("assistant", final_reply)
                 self._finalize_agent_trace(final_reply)
                 self.save_memory()
@@ -1427,6 +1519,7 @@ class AssistantWithMemory:
         file_cmd = self.extract_file_command(user_message)
         system_cmd = self.extract_system_command(user_message)
         screen_cmd = self.extract_screen_command(user_message)
+        input_cmd = self.extract_input_command(user_message)
         expression = self.extract_math_expression(user_message)
         code = self.extract_python_code(user_message)
 
@@ -1498,6 +1591,15 @@ class AssistantWithMemory:
                 )
             else:
                 final_reply = str(tool_result)
+        elif input_cmd:
+            action_payload = {"action": input_cmd["action"], "args": input_cmd.get("args", {})}
+            tool_result = self.execute_json_tool_action(action_payload)
+            self.add_tool_trace(user_message, 1, action_payload, tool_result)
+            summary = self.summarize_tool_result(action_payload, tool_result)
+            self._record_trace_plan([{"step": 1, "description": input_cmd.get("description", input_cmd["action"]), "tool": input_cmd["action"], "args": input_cmd.get("args", {})}])
+            self._record_trace_step(1, input_cmd.get("description", input_cmd["action"]), input_cmd["action"], input_cmd.get("args", {}), summary)
+            self._record_trace_context(input_cmd["action"], summary)
+            final_reply = str(tool_result)
         elif expression:
             result = calculator(expression)
             final_reply = f"Result: {result}"

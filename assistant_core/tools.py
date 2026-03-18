@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 from urllib.parse import urlparse, urlunparse
 
+SENSITIVE_TOOLS = {"click", "type_text"}
+
 TOOLS = {
     "list_files": {
         "description": "List files in the workspace directory.",
@@ -51,17 +53,31 @@ TOOLS = {
         "args": {},
         "required": [],
     },
+    "click": {
+        "description": "Click at a specific screen coordinate.",
+        "args": {"x": "integer", "y": "integer"},
+        "required": ["x", "y"],
+    },
+    "type_text": {
+        "description": "Type text into the currently focused application.",
+        "args": {"text": "string"},
+        "required": ["text"],
+    },
 }
 
 
-def tools_prompt_text(selected_tools=None) -> str:
+def tools_prompt_text(selected_tools=None, include_sensitive=False) -> str:
+    available_tools = TOOLS
+    if not include_sensitive:
+        available_tools = {name: schema for name, schema in TOOLS.items() if name not in SENSITIVE_TOOLS}
+
     if not selected_tools:
-        return json.dumps(TOOLS, indent=2, ensure_ascii=False)
+        return json.dumps(available_tools, indent=2, ensure_ascii=False)
 
     selected = set(selected_tools)
-    filtered = {name: schema for name, schema in TOOLS.items() if name in selected}
+    filtered = {name: schema for name, schema in available_tools.items() if name in selected}
     if not filtered:
-        filtered = TOOLS
+        filtered = available_tools
     return json.dumps(filtered, indent=2, ensure_ascii=False)
 
 
@@ -167,7 +183,12 @@ def open_app(app_name: str) -> str:
 
 def capture_screen(output_dir: str = "screenshots"):
     try:
-        from PIL import Image, ImageGrab
+        import mss
+    except Exception as e:
+        return f"Screen capture unavailable: mss is not installed ({e})."
+
+    try:
+        from PIL import Image
     except Exception as e:
         return f"Screen capture unavailable: Pillow is not installed ({e})."
 
@@ -178,35 +199,70 @@ def capture_screen(output_dir: str = "screenshots"):
     image_path = os.path.join(target_dir, f"screen_{ts}.png")
 
     try:
-        import mss
-    except Exception:
-        mss = None
+        with mss.mss() as sct:
+            monitors = getattr(sct, "monitors", [])
+            if len(monitors) < 2:
+                return "Screen capture unavailable: no primary monitor detected."
 
-    try:
-        if mss is not None:
-            with mss.mss() as sct:
-                monitors = getattr(sct, "monitors", [])
-                if len(monitors) < 2:
-                    return "Screen capture unavailable: no primary monitor detected."
-
-                monitor = monitors[1]
-                shot = sct.grab(monitor)
-                image = Image.frombytes("RGB", shot.size, shot.rgb)
-                image.save(image_path)
-                width, height = shot.size
-        else:
-            image = ImageGrab.grab()
+            monitor = monitors[1]
+            shot = sct.grab(monitor)
+            image = Image.frombytes("RGB", shot.size, shot.rgb)
             image.save(image_path)
-            width, height = image.size
     except Exception as e:
         return f"Screen capture error: {e}"
 
     return {
         "image_path": os.path.relpath(image_path, os.getcwd()).replace("\\", "/"),
-        "width": int(width),
-        "height": int(height),
+        "width": int(shot.size[0]),
+        "height": int(shot.size[1]),
         "timestamp": ts,
     }
+
+
+def click_screen(x, y):
+    try:
+        import pyautogui
+    except Exception as e:
+        return f"Click unavailable: pyautogui is not installed ({e})."
+
+    try:
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
+        x_pos = int(x)
+        y_pos = int(y)
+    except Exception as e:
+        return f"Click unavailable: invalid coordinates ({e})."
+
+    try:
+        pyautogui.click(x=x_pos, y=y_pos)
+    except pyautogui.FailSafeException:
+        return "Click aborted by failsafe. Move the mouse away from the screen corner and try again."
+    except Exception as e:
+        return f"Click error: {e}"
+
+    return {"action": "click", "x": x_pos, "y": y_pos, "status": "clicked"}
+
+
+def type_text(text):
+    try:
+        import pyautogui
+    except Exception as e:
+        return f"Type unavailable: pyautogui is not installed ({e})."
+
+    content = str(text or "")
+    if not content:
+        return "Type unavailable: no text provided."
+
+    try:
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
+        pyautogui.write(content, interval=0.01)
+    except pyautogui.FailSafeException:
+        return "Typing aborted by failsafe. Move the mouse away from the screen corner and try again."
+    except Exception as e:
+        return f"Type error: {e}"
+
+    return {"action": "type_text", "text_length": len(content), "status": "typed"}
 
 
 def web_search(query: str, max_results: int = 5, timeout_seconds: int = 10) -> str:
