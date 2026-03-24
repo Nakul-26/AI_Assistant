@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import stat
 from datetime import datetime
 from pathlib import Path
 
@@ -1486,8 +1487,26 @@ class AssistantWithMemory:
                     return f"File not found: {path}"
                 if not os.path.isfile(path):
                     return f"Path is not a file: {path}"
-                os.remove(path)
-                return f"File deleted: {path}"
+                try:
+                    os.chmod(path, stat.S_IWRITE)
+                except Exception:
+                    pass
+
+                try:
+                    os.remove(path)
+                    return f"File deleted: {path}"
+                except PermissionError:
+                    try:
+                        from send2trash import send2trash
+
+                        send2trash(str(path))
+                        return f"File moved to trash: {path}"
+                    except Exception:
+                        return (
+                            f"File delete failed: access denied for {path}. "
+                            "This usually means the file is locked by another process or the current environment "
+                            "does not allow delete/rename operations in this directory."
+                        )
 
             if action == "read":
                 if not os.path.exists(path):

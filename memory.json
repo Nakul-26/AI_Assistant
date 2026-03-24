@@ -2,22 +2,6 @@
   "short_term": [
     {
       "role": "user",
-      "content": "click 10 20"
-    },
-    {
-      "role": "assistant",
-      "content": "AI wants to click at (10, 20). Reply 'yes' to confirm or 'no' to cancel."
-    },
-    {
-      "role": "user",
-      "content": "no"
-    },
-    {
-      "role": "assistant",
-      "content": "Cancelled pending action."
-    },
-    {
-      "role": "user",
       "content": "type text: hello world"
     },
     {
@@ -74,16 +58,88 @@
     },
     {
       "role": "user",
-      "content": "can you do a mouse click"
+      "content": "ok"
     },
     {
       "role": "assistant",
-      "content": "yes"
+      "content": "ok"
+    },
+    {
+      "role": "user",
+      "content": "quit"
+    },
+    {
+      "role": "assistant",
+      "content": "quit"
+    },
+    {
+      "role": "user",
+      "content": "run python print('hi')"
+    },
+    {
+      "role": "assistant",
+      "content": "Python execution is disabled for safety. Use explicit tools: list/read/write file, run command, or open app."
     }
   ],
   "long_term": {},
-  "tasks": [],
-  "plans": [],
+  "tasks": [
+    {
+      "id": 1,
+      "title": "Test task",
+      "status": "in_progress",
+      "created_at": "2026-03-24"
+    }
+  ],
+  "plans": [
+    {
+      "id": 1,
+      "goal": "Test a simple feature",
+      "status": "in_progress",
+      "created_at": "2026-03-24",
+      "steps": [
+        {
+          "step": 1,
+          "description": "Define the feature and its requirements",
+          "status": "pending"
+        },
+        {
+          "step": 2,
+          "description": "Write the code for implementing the feature",
+          "status": "pending"
+        },
+        {
+          "step": 3,
+          "description": "Integrate the new code into the existing project",
+          "status": "pending"
+        },
+        {
+          "step": 4,
+          "description": "Test the feature locally to ensure it functions correctly",
+          "status": "pending"
+        },
+        {
+          "step": 5,
+          "description": "Fix any bugs or issues that arise during testing",
+          "status": "pending"
+        },
+        {
+          "step": 6,
+          "description": "Commit and push the changes to version control (if applicable)",
+          "status": "pending"
+        },
+        {
+          "step": 7,
+          "description": "Request a code review from team members (if applicable)",
+          "status": "pending"
+        },
+        {
+          "step": 8,
+          "description": "Merge the changes into the main branch or deploy to a staging environment",
+          "status": "pending"
+        }
+      ]
+    }
+  ],
   "pending_action": null,
   "tool_traces": [
     {
