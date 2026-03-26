@@ -1,6 +1,7 @@
 import os
 
 from .assistant import AssistantWithMemory
+from .speaker import speaker
 
 
 def _drain_console_input():
@@ -31,3 +32,4 @@ def run_chat_loop():
             break
         reply = assistant.process_request(msg)
         print("AI:", reply)
+        speaker.speak(reply)

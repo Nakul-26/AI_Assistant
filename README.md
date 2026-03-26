@@ -47,6 +47,7 @@ Still needs manual end-to-end testing:
 
 - Interactive CLI chat loop started from `ai_with_tools.py`
 - Ollama model support with `OLLAMA_MODEL` environment variable override
+- Optional offline text-to-speech for final assistant replies using `pyttsx3`
 - Short-term conversation memory saved across runs
 - Long-term memory extraction for user details like name and projects
 - Task management: add, list, and complete tasks
@@ -92,5 +93,41 @@ Still needs manual end-to-end testing:
 - `assistant_core/workspace_index.py` - workspace indexing and search support
 
 ## Testing
+
+## Text To Speech
+
+Install the optional dependency:
+
+```bash
+pip install pyttsx3
+```
+
+Then run the assistant normally:
+
+```bash
+python ai_with_tools.py
+```
+
+By default, the CLI will speak final assistant replies after printing them.
+
+Set `ASSISTANT_TTS=0` to disable speech without uninstalling the package.
+
+## Local Python Environment
+
+This project now uses a local virtual environment in `.venv`.
+
+Start the assistant without manually activating the environment:
+
+```bash
+start_assistant.bat
+```
+
+PowerShell variant:
+
+```powershell
+.\start_assistant.ps1
+```
+
+The launcher scripts use `.venv\Scripts\python.exe` directly, so they automatically run in the project environment.
 
 Use the feature-by-feature checklist in [TEST_CHECKLIST.md](/D:/nakul/python_ai_scripts/TEST_CHECKLIST.md).

@@ -1,0 +1,6 @@
+ollama
+mss
+Pillow
+pyautogui
+Send2Trash
+pyttsx3

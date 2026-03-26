@@ -15,3 +15,8 @@ logs
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Python environments
+.venv/
+.tmp/
+__pycache__/
