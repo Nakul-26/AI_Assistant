@@ -2,14 +2,6 @@
   "short_term": [
     {
       "role": "user",
-      "content": "type text: hello world"
-    },
-    {
-      "role": "assistant",
-      "content": "AI wants to type 11 characters into the focused window. Reply 'yes' to confirm or 'no' to cancel."
-    },
-    {
-      "role": "user",
       "content": "no"
     },
     {
@@ -79,6 +71,14 @@
     {
       "role": "assistant",
       "content": "Python execution is disabled for safety. Use explicit tools: list/read/write file, run command, or open app."
+    },
+    {
+      "role": "user",
+      "content": "Heidi"
+    },
+    {
+      "role": "assistant",
+      "content": "Hi"
     }
   ],
   "long_term": {},

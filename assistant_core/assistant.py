@@ -509,6 +509,39 @@ class AssistantWithMemory:
         # Keep hints restricted to tools exposed in TOOLS.
         return [name for name in TOOLS.keys() if name in tools and name not in SENSITIVE_TOOLS]
 
+    def _planner_debug_enabled(self):
+        value = os.getenv("ASSISTANT_DEBUG_PLANNER", "0").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _should_use_direct_chat(self, user_message, hinted_tools=None):
+        msg = str(user_message or "").strip()
+        if not msg:
+            return True
+
+        if hinted_tools:
+            return False
+
+        msg_lower = msg.lower()
+        word_count = len(re.findall(r"\b[\w']+\b", msg_lower))
+
+        if word_count <= 3:
+            return True
+
+        short_conversational_patterns = [
+            r"^(hi|hello|hey|heya|yo)$",
+            r"^(thanks|thank you)$",
+            r"^(yes|yeah|yep|no|nope|okay|ok)$",
+            r"^(good morning|good afternoon|good evening|good night)$",
+            r"^(i am|i'm|my name is)\s+[a-zA-Z][a-zA-Z\s'-]{0,40}$",
+        ]
+        if any(re.fullmatch(pattern, msg_lower) for pattern in short_conversational_patterns):
+            return True
+
+        if word_count <= 8 and any(token in msg_lower for token in ["hello", "hi", "hey", "thanks", "thank you", "i am", "i'm", "my name is"]):
+            return True
+
+        return False
+
     def generate_execution_plan(self, user_message="", hinted_tools=None):
         tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()
         workspace_overview = format_workspace_overview(self.workspace_map, query=user_message, limit=20)
@@ -544,19 +577,22 @@ class AssistantWithMemory:
             parsed = self.parse_execution_plan(response_text)
             if parsed:
                 return parsed
-            print("\n[PLANNER RAW RESPONSE SUMMARY]")
-            print(self._summarize_debug_text(response_text))
-            print("\n[PLANNER PARSE RESULT]")
-            print(None)
+            if self._planner_debug_enabled():
+                print("\n[PLANNER RAW RESPONSE SUMMARY]")
+                print(self._summarize_debug_text(response_text))
+                print("\n[PLANNER PARSE RESULT]")
+                print(None)
         except Exception:
-            print("\n[PLANNER RAW RESPONSE SUMMARY]")
-            print(self._summarize_debug_text(response_text or "(planner call failed before content was returned)"))
-            print("\n[PLANNER PARSE RESULT]")
-            print(None)
+            if self._planner_debug_enabled():
+                print("\n[PLANNER RAW RESPONSE SUMMARY]")
+                print(self._summarize_debug_text(response_text or "(planner call failed before content was returned)"))
+                print("\n[PLANNER PARSE RESULT]")
+                print(None)
 
         heuristic_plan = self._heuristic_execution_plan(user_message, hinted_tools=hinted_tools)
-        print("\n[PLANNER FALLBACK USED]")
-        print(heuristic_plan)
+        if self._planner_debug_enabled():
+            print("\n[PLANNER FALLBACK USED]")
+            print(heuristic_plan)
         self._record_trace_plan(heuristic_plan)
         return heuristic_plan
 
@@ -677,6 +713,8 @@ class AssistantWithMemory:
 
     def ask_ai_with_json_tools(self, user_message=""):
         hinted_tools = self.infer_relevant_tools(user_message)
+        if self._should_use_direct_chat(user_message, hinted_tools=hinted_tools):
+            return self.ask_ai()
         execution_plan = self.generate_plan(user_message=user_message, hinted_tools=hinted_tools)
         self._record_trace_plan(execution_plan)
         tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()

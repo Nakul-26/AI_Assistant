@@ -46,6 +46,7 @@ Still needs manual end-to-end testing:
 ## Features
 
 - Interactive CLI chat loop started from `ai_with_tools.py`
+- Optional Windows voice conversation mode with microphone input
 - Ollama model support with `OLLAMA_MODEL` environment variable override
 - Optional offline text-to-speech for final assistant replies using `pyttsx3`
 - Short-term conversation memory saved across runs
@@ -111,6 +112,33 @@ python ai_with_tools.py
 By default, the CLI will speak final assistant replies after printing them.
 
 Set `ASSISTANT_TTS=0` to disable speech without uninstalling the package.
+
+On Windows, the assistant also includes a built-in PowerShell/System.Speech fallback for spoken output if `pyttsx3` is unavailable.
+
+## Voice Conversation Mode
+
+Run the assistant in voice mode on Windows:
+
+```bash
+python ai_with_tools.py --mode voice
+```
+
+The voice loop:
+
+- listens for one spoken request at a time
+- sends the transcript through the existing assistant pipeline
+- speaks the reply through the audio output
+- listens for interrupt and exit keywords while the reply is being spoken
+- falls back to typed input in the same loop if speech recognition is unavailable
+
+Useful environment variables:
+
+- `ASSISTANT_MODE=voice`
+- `ASSISTANT_INTERRUPT_KEYWORDS=stop assistant,stop speaking`
+- `ASSISTANT_EXIT_KEYWORDS=exit voice mode,goodbye assistant`
+- `ASSISTANT_STT_CULTURE=en-US`
+- `ASSISTANT_TEXT_FALLBACK=1`
+- `ASSISTANT_TTS_VOICE=Microsoft Zira Desktop`
 
 ## Local Python Environment
 
