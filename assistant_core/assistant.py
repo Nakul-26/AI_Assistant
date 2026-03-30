@@ -54,6 +54,7 @@ class AssistantWithMemory:
                 "tasks": [],
                 "plans": [],
                 "pending_action": None,
+                "pending_plan": None,
                 "tool_traces": [],
             }
         try:
@@ -67,6 +68,7 @@ class AssistantWithMemory:
                     "tasks": [],
                     "plans": [],
                     "pending_action": None,
+                    "pending_plan": None,
                     "tool_traces": [],
                 }
 
@@ -76,6 +78,7 @@ class AssistantWithMemory:
                 tasks = data.get("tasks", [])
                 plans = data.get("plans", [])
                 pending_action = data.get("pending_action")
+                pending_plan = data.get("pending_plan")
                 tool_traces = data.get("tool_traces", [])
                 if not isinstance(long_term, dict):
                     long_term = {}
@@ -85,6 +88,8 @@ class AssistantWithMemory:
                     plans = []
                 if pending_action is not None and not isinstance(pending_action, dict):
                     pending_action = None
+                if pending_plan is not None and not isinstance(pending_plan, dict):
+                    pending_plan = None
                 if not isinstance(tool_traces, list):
                     tool_traces = []
                 return {
@@ -93,6 +98,7 @@ class AssistantWithMemory:
                     "tasks": tasks,
                     "plans": plans,
                     "pending_action": pending_action,
+                    "pending_plan": pending_plan,
                     "tool_traces": tool_traces[-MAX_TOOL_TRACES:],
                 }
 
@@ -102,6 +108,7 @@ class AssistantWithMemory:
                 "tasks": [],
                 "plans": [],
                 "pending_action": None,
+                "pending_plan": None,
                 "tool_traces": [],
             }
         except Exception:
@@ -111,6 +118,7 @@ class AssistantWithMemory:
                 "tasks": [],
                 "plans": [],
                 "pending_action": None,
+                "pending_plan": None,
                 "tool_traces": [],
             }
 
@@ -716,6 +724,18 @@ class AssistantWithMemory:
         if self._should_use_direct_chat(user_message, hinted_tools=hinted_tools):
             return self.ask_ai()
         execution_plan = self.generate_plan(user_message=user_message, hinted_tools=hinted_tools)
+        self._set_pending_plan(
+            "tool_execution",
+            {
+                "user_message": user_message,
+                "hinted_tools": sorted(hinted_tools) if hinted_tools else [],
+                "execution_plan": execution_plan,
+            },
+        )
+        return self._format_plan_preview(execution_plan)
+
+    def _run_json_tool_plan(self, user_message, execution_plan, hinted_tools=None):
+        hinted_tools = hinted_tools or []
         self._record_trace_plan(execution_plan)
         tool_list_text = tools_prompt_text(selected_tools=hinted_tools) if hinted_tools else tools_prompt_text()
         plan_text = json.dumps(execution_plan, indent=2, ensure_ascii=False)
@@ -777,23 +797,23 @@ class AssistantWithMemory:
 
             tool_result = self.execute_json_tool_action(action_payload)
             self.add_tool_trace(user_message, step_index, action_payload, tool_result)
+            summarized_result = self.summarize_tool_result(action_payload, tool_result)
             self._record_trace_step(
                 step_index,
                 step_description,
                 action_payload.get("action"),
                 action_payload.get("args", {}),
-                self.summarize_tool_result(action_payload, tool_result),
+                summarized_result,
             )
             if action_payload.get("action") == "read_file":
-                self._record_trace_context(action_payload.get("args", {}).get("path", "read_file"), self.summarize_tool_result(action_payload, tool_result))
+                self._record_trace_context(action_payload.get("args", {}).get("path", "read_file"), summarized_result)
             elif action_payload.get("action") == "workspace_search":
-                self._record_trace_context("workspace_search", self.summarize_tool_result(action_payload, tool_result))
+                self._record_trace_context("workspace_search", summarized_result)
             elif action_payload.get("action") == "capture_screen":
-                self._record_trace_context("capture_screen", self.summarize_tool_result(action_payload, tool_result))
+                self._record_trace_context("capture_screen", summarized_result)
             if isinstance(self.memory.get("pending_action"), dict) or "Reply 'yes'" in tool_result:
                 return tool_result
 
-            summarized_result = self.summarize_tool_result(action_payload, tool_result)
             messages.append({"role": "tool_result", "content": summarized_result})
             completed_steps.append(
                 {
@@ -1442,6 +1462,12 @@ class AssistantWithMemory:
     def _clear_pending_action(self):
         self.memory["pending_action"] = None
 
+    def _set_pending_plan(self, plan_type, payload):
+        self.memory["pending_plan"] = {"type": plan_type, "payload": payload}
+
+    def _clear_pending_plan(self):
+        self.memory["pending_plan"] = None
+
     def _execute_pending_action(self):
         pending = self.memory.get("pending_action")
         if not isinstance(pending, dict):
@@ -1468,6 +1494,32 @@ class AssistantWithMemory:
             return result
         self._clear_pending_action()
         return "Pending action was invalid and has been cleared."
+
+    def _execute_pending_plan(self):
+        pending = self.memory.get("pending_plan")
+        if not isinstance(pending, dict):
+            return None
+        plan_type = pending.get("type")
+        payload = pending.get("payload")
+        self._clear_pending_plan()
+
+        if plan_type == "tool_execution" and isinstance(payload, dict):
+            return self._run_json_tool_plan(
+                payload.get("user_message", ""),
+                payload.get("execution_plan", []),
+                hinted_tools=payload.get("hinted_tools"),
+            )
+
+        return "Pending plan was invalid and has been cleared."
+
+    def _format_plan_preview(self, execution_plan):
+        lines = []
+        for step in execution_plan[:MAX_TOOL_STEPS]:
+            step_no = step.get("step", len(lines) + 1)
+            description = str(step.get("description", "")).strip() or "Perform the next action."
+            lines.append(f"{step_no}. {description}")
+        plan_text = "\n".join(lines) if lines else "1. Respond to the user."
+        return f"I plan to:\n{plan_text}\n\nProceed? (yes/no)"
 
     def execute_file_command(self, command, approved=False):
         action = command.get("action")
@@ -1603,6 +1655,23 @@ class AssistantWithMemory:
             self._finalize_agent_trace(final_reply)
             self.save_memory()
             return final_reply
+
+        pending_plan = self.memory.get("pending_plan")
+        if isinstance(pending_plan, dict):
+            if self._is_confirmation(user_message):
+                final_reply = self._execute_pending_plan() or "No pending plan to confirm."
+                self.add_to_short_term("assistant", final_reply)
+                self._finalize_agent_trace(final_reply)
+                self.save_memory()
+                return final_reply
+            if self._is_rejection(user_message):
+                self._clear_pending_plan()
+                final_reply = "Okay, cancelled."
+                self.add_to_short_term("assistant", final_reply)
+                self._finalize_agent_trace(final_reply)
+                self.save_memory()
+                return final_reply
+            self._clear_pending_plan()
 
         plan_cmd = self.extract_plan_command(user_message)
         autonomous_cmd = self.extract_autonomous_command(user_message)
