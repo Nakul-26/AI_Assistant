@@ -1,6 +1,9 @@
 import json
+import os
 
 import ollama
+
+from .speaker import speaker
 
 
 class AutonomousExecutor:
@@ -21,8 +24,12 @@ class AutonomousExecutor:
         if not plan or not step:
             return "No pending steps in active plans."
 
+        progress_label = self._format_progress_label(plan, step)
+        self._announce_progress(progress_label)
         decision = self._decide_action(plan, step)
-        return self._execute_decision(plan, step, decision)
+        result = self._execute_decision(plan, step, decision)
+        self._announce_progress("Done.")
+        return result
 
     def _next_pending_step(self):
         for plan in self.assistant.memory.get("plans", []):
@@ -32,6 +39,39 @@ class AutonomousExecutor:
                 if step.get("status") == "pending":
                     return plan, step
         return None, None
+
+    def _format_progress_label(self, plan, step):
+        steps = plan.get("steps", [])
+        total_steps = len(steps)
+        current_index = 0
+
+        for idx, candidate in enumerate(steps, start=1):
+            if candidate is step:
+                current_index = idx
+                break
+
+        if current_index <= 0:
+            raw_step_no = step.get("step")
+            if isinstance(raw_step_no, int) and raw_step_no > 0:
+                current_index = raw_step_no
+            else:
+                current_index = 1
+
+        description = str(step.get("description", "")).strip() or "Working..."
+        if total_steps > 0:
+            return f"Step {current_index}/{total_steps}: {description}"
+        return f"Step {current_index}: {description}"
+
+    def _announce_progress(self, message):
+        text = str(message or "").strip()
+        if not text:
+            return
+
+        print(f"\n[Progress] {text}")
+
+        speak_progress = os.getenv("ASSISTANT_SPEAK_PROGRESS", "0").strip().lower()
+        if speak_progress in {"1", "true", "yes", "on"}:
+            speaker.speak(text)
 
     def _decide_action(self, plan, step):
         prompt = (
