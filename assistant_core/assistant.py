@@ -1129,6 +1129,126 @@ class AssistantWithMemory:
                 return True
         return False
 
+    def get_active_plan_step(self):
+        for plan in self.memory.get("plans", []):
+            if plan.get("status") == "completed":
+                continue
+            for step in plan.get("steps", []):
+                if step.get("status") == "pending":
+                    return plan, step
+        return None, None
+
+    def _is_plan_modification_request(self, user_message):
+        msg_lower = str(user_message or "").strip().lower()
+        if not msg_lower:
+            return False
+
+        cues = [
+            "skip",
+            "change",
+            "modify",
+            "instead",
+            "do step",
+            "do this",
+            "don't",
+            "dont",
+            "do not",
+        ]
+        if not any(cue in msg_lower for cue in cues):
+            return False
+
+        plan, step = self.get_active_plan_step()
+        return bool(plan and step)
+
+    def _clear_pending_execution_for_step(self, plan_id, step_no):
+        pending = self.memory.get("pending_action")
+        if not isinstance(pending, dict):
+            return False
+
+        if pending.get("type") != "system_command":
+            return False
+
+        payload = pending.get("payload")
+        if not isinstance(payload, dict):
+            return False
+
+        if payload.get("plan_id") == plan_id and payload.get("step") == step_no:
+            self._clear_pending_action()
+            return True
+        return False
+
+    def _move_pending_step_to_front(self, plan, target_step_no):
+        if not isinstance(target_step_no, int):
+            return None
+
+        steps = plan.get("steps", [])
+        current_index = None
+        target_index = None
+
+        for idx, step in enumerate(steps):
+            if current_index is None and step.get("status") == "pending":
+                current_index = idx
+            if step.get("step") == target_step_no:
+                target_index = idx
+
+        if current_index is None or target_index is None:
+            return None
+
+        target_step = steps[target_index]
+        if target_step.get("status") == "completed":
+            return "completed"
+        if target_index == current_index:
+            return target_step
+
+        steps.insert(current_index, steps.pop(target_index))
+        return target_step
+
+    def modify_current_plan(self, user_message):
+        plan, step = self.get_active_plan_step()
+        if not plan or not step:
+            return "There is no active plan step to modify."
+
+        msg = str(user_message or "").strip()
+        msg_lower = msg.lower()
+        plan_id = plan.get("id")
+        step_no = step.get("step")
+
+        if "skip" in msg_lower:
+            self._clear_pending_execution_for_step(plan_id, step_no)
+            if isinstance(plan_id, int) and isinstance(step_no, int) and self.mark_plan_step_completed(plan_id, step_no):
+                next_plan, next_step = self.get_active_plan_step()
+                if next_plan and next_step and next_plan.get("id") == plan_id:
+                    return (
+                        f"Skipped Plan #{plan_id} Step {step_no}. "
+                        f"Moving to Step {next_step.get('step')}: {next_step.get('description', '')}"
+                    )
+                return f"Skipped Plan #{plan_id} Step {step_no}."
+            return "I could not skip the current plan step."
+
+        reorder_match = re.search(r"\bdo\s+step\s+(\d+)\s+first\b", msg_lower)
+        if reorder_match:
+            target_step_no = int(reorder_match.group(1))
+            moved_step = self._move_pending_step_to_front(plan, target_step_no)
+            if moved_step == "completed":
+                return f"Step {target_step_no} is already completed."
+            if moved_step is None:
+                return f"I could not find a pending Step {target_step_no} in the active plan."
+            self._clear_pending_execution_for_step(plan_id, step_no)
+            return f"Updated the plan. Next step is Step {moved_step.get('step')}: {moved_step.get('description', '')}"
+
+        replacement_text = ""
+        if "instead" in msg_lower:
+            replacement_text = re.split(r"\binstead\b", msg, maxsplit=1, flags=re.IGNORECASE)[-1].strip(" .,:;-")
+        elif any(token in msg_lower for token in ["don't", "dont", "do not", "change", "modify", "do this"]):
+            replacement_text = msg
+
+        if replacement_text:
+            step["description"] = replacement_text
+            self._clear_pending_execution_for_step(plan_id, step_no)
+            return f"Updated Plan #{plan_id} Step {step_no}: {replacement_text}"
+
+        return "I understood that as a plan change request, but I could not determine the modification."
+
     def extract_plan_command(self, user_message):
         msg = user_message.strip()
         msg_lower = msg.lower()
@@ -1618,6 +1738,13 @@ class AssistantWithMemory:
         self.extract_long_term_memory(user_message)
         self.add_to_short_term("user", user_message)
         self.sync_plan_step_statuses_from_tasks()
+
+        if self._is_plan_modification_request(user_message):
+            final_reply = self.modify_current_plan(user_message)
+            self.add_to_short_term("assistant", final_reply)
+            self._finalize_agent_trace(final_reply)
+            self.save_memory()
+            return final_reply
 
         pending = self.memory.get("pending_action")
         if isinstance(pending, dict):
