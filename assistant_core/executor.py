@@ -20,13 +20,19 @@ class AutonomousExecutor:
         return f"Autonomy status: {len(plans)} active plans, {pending_steps} pending steps."
 
     def run_cycle(self):
+        if self.assistant._background_stop_requested():
+            return "Background task stopped before the autonomous cycle started."
+
         plan, step = self._next_pending_step()
         if not plan or not step:
             return "No pending steps in active plans."
 
         progress_label = self._format_progress_label(plan, step)
+        self.assistant._set_background_step(progress_label)
         self._announce_progress(progress_label)
         decision = self._decide_action(plan, step)
+        if self.assistant._background_stop_requested():
+            return "Background task stopped before executing the autonomous action."
         result = self._execute_decision(plan, step, decision)
         self._announce_progress("Done.")
         return result

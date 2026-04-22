@@ -45,6 +45,10 @@ Use this checklist to verify the assistant feature-by-feature. Status values:
 
 - `TODO` Run `autonomous status`
 - `TODO` Run `run autonomous cycle`
+- `PASS` Verify background runner starts, reports status, and accepts stop requests through assistant API
+- `TODO` Verify CLI remains responsive while a confirmed plan runs in background
+- `TODO` Verify `status` reports the active background step
+- `TODO` Verify `stop` interrupts at the next safe checkpoint
 - `TODO` Verify `[Progress] Step x/y: ...` prints before the autonomous action
 - `TODO` Verify `[Progress] Done.` prints after the autonomous action
 - `TODO` Verify `ASSISTANT_SPEAK_PROGRESS=1` speaks progress updates

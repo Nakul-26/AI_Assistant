@@ -2,6 +2,7 @@ import json
 import os
 import re
 import stat
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +46,19 @@ class AssistantWithMemory:
         self.workspace_map = build_workspace_map(self.repo_root)
         self.memory = self.load_memory()
         self.executor = AutonomousExecutor(self)
+        self.is_running_task = False
+        self._background_thread = None
+        self._background_lock = threading.RLock()
+        self._background_stop_event = threading.Event()
+        self._background_state = {
+            "description": "",
+            "current_step": "",
+            "last_result": "",
+            "error": "",
+            "started_at": None,
+            "finished_at": None,
+            "stop_requested": False,
+        }
 
     def load_memory(self):
         if not os.path.exists(self.memory_file):
@@ -124,8 +138,14 @@ class AssistantWithMemory:
 
     def save_memory(self):
         try:
-            with open(self.memory_file, "w", encoding="utf-8") as f:
-                json.dump(self.memory, f, indent=2, ensure_ascii=False)
+            lock = getattr(self, "_background_lock", None)
+            if lock is None:
+                with open(self.memory_file, "w", encoding="utf-8") as f:
+                    json.dump(self.memory, f, indent=2, ensure_ascii=False)
+                return
+            with lock:
+                with open(self.memory_file, "w", encoding="utf-8") as f:
+                    json.dump(self.memory, f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"[Memory Save Error] {e}")
 
@@ -162,6 +182,88 @@ class AssistantWithMemory:
         self.memory["short_term"].append({"role": role, "content": self._stringify_message_content(content)})
         if len(self.memory["short_term"]) > MAX_SHORT_TERM_MESSAGES:
             self.memory["short_term"] = self.memory["short_term"][-MAX_SHORT_TERM_MESSAGES:]
+
+    def _reset_background_state(self, description):
+        with self._background_lock:
+            self._background_state = {
+                "description": str(description or "Background task").strip(),
+                "current_step": "Starting...",
+                "last_result": "",
+                "error": "",
+                "started_at": datetime.utcnow().isoformat() + "Z",
+                "finished_at": None,
+                "stop_requested": False,
+            }
+
+    def _set_background_step(self, message):
+        with self._background_lock:
+            self._background_state["current_step"] = str(message or "").strip()
+
+    def _background_stop_requested(self):
+        return self._background_stop_event.is_set()
+
+    def run_background_task(self, description, target):
+        with self._background_lock:
+            if self.is_running_task:
+                return False
+            self.is_running_task = True
+            self._background_stop_event.clear()
+            self._reset_background_state(description)
+
+        def task():
+            result = ""
+            error = ""
+            try:
+                result = target()
+                if result:
+                    self.add_to_short_term("assistant", result)
+                    self.save_memory()
+            except Exception as exc:
+                error = str(exc)
+                result = f"Background task failed: {error}"
+                self.add_to_short_term("assistant", result)
+                self.save_memory()
+            finally:
+                with self._background_lock:
+                    self.is_running_task = False
+                    self._background_state["last_result"] = str(result or "").strip()
+                    self._background_state["error"] = error
+                    self._background_state["finished_at"] = datetime.utcnow().isoformat() + "Z"
+                    if self._background_state.get("stop_requested"):
+                        self._background_state["current_step"] = "Stopped."
+                    elif error:
+                        self._background_state["current_step"] = "Failed."
+                    else:
+                        self._background_state["current_step"] = "Done."
+
+        self._background_thread = threading.Thread(target=task, daemon=True)
+        self._background_thread.start()
+        return True
+
+    def request_stop_background_task(self):
+        with self._background_lock:
+            if not self.is_running_task:
+                return "No background task is running."
+            self._background_state["stop_requested"] = True
+            self._background_state["current_step"] = "Stop requested..."
+            self._background_stop_event.set()
+        return "Stop requested. The background task will stop at the next safe checkpoint."
+
+    def background_status_text(self):
+        with self._background_lock:
+            state = dict(self._background_state)
+            running = self.is_running_task
+
+        if running:
+            step = state.get("current_step") or "Working..."
+            description = state.get("description") or "Background task"
+            return f"Background task running: {description}\n{step}"
+
+        last_result = state.get("last_result")
+        if last_result:
+            result_preview = last_result[:500] + ("..." if len(last_result) > 500 else "")
+            return f"No background task is running.\nLast result: {result_preview}"
+        return "No background task is running."
 
     def add_tool_trace(self, request, step, action_payload, result):
         self.memory.setdefault("tool_traces", [])
@@ -764,10 +866,13 @@ class AssistantWithMemory:
         completed_steps = []
 
         for plan_step in execution_plan[:MAX_TOOL_STEPS]:
+            if self._background_stop_requested():
+                return "Background task stopped before the next planned step."
             step_index = plan_step.get("step")
             step_description = plan_step.get("description", "")
             expected_tool = plan_step.get("tool", "")
             expected_args = plan_step.get("args", {})
+            self._set_background_step(f"Step {step_index}: {step_description}")
             step_prompt = (
                 f"Execute planned step {step_index}: {step_description}\n"
                 f"Preferred tool: {expected_tool or 'final'}\n"
@@ -795,6 +900,8 @@ class AssistantWithMemory:
             if hinted_tools and action_payload["action"] not in hinted_tools:
                 print(f"[tool-warning] Model chose '{action_payload['action']}' outside hint set {hinted_tools}")
 
+            if self._background_stop_requested():
+                return "Background task stopped before executing the next tool action."
             tool_result = self.execute_json_tool_action(action_payload)
             self.add_tool_trace(user_message, step_index, action_payload, tool_result)
             summarized_result = self.summarize_tool_result(action_payload, tool_result)
@@ -824,6 +931,8 @@ class AssistantWithMemory:
                 }
             )
 
+        if self._background_stop_requested():
+            return "Background task stopped before preparing the final response."
         final_response = self._chat_with_role_fallback(
             messages
             + [
@@ -1632,6 +1741,37 @@ class AssistantWithMemory:
 
         return "Pending plan was invalid and has been cleared."
 
+    def _start_pending_plan_background(self):
+        pending = self.memory.get("pending_plan")
+        if not isinstance(pending, dict):
+            return "No pending plan to confirm."
+        if self.is_running_task:
+            return "A background task is already running. Ask for status or stop it before starting another."
+
+        plan_type = pending.get("type")
+        payload = pending.get("payload")
+        self._clear_pending_plan()
+
+        if plan_type != "tool_execution" or not isinstance(payload, dict):
+            return "Pending plan was invalid and has been cleared."
+
+        execution_plan = payload.get("execution_plan", [])
+        step_count = min(len(execution_plan), MAX_TOOL_STEPS) if isinstance(execution_plan, list) else 0
+        user_message = payload.get("user_message", "")
+        description = f"{step_count or 1}-step plan for: {user_message}".strip()
+
+        started = self.run_background_task(
+            description,
+            lambda: self._run_json_tool_plan(
+                user_message,
+                execution_plan,
+                hinted_tools=payload.get("hinted_tools"),
+            ),
+        )
+        if not started:
+            return "A background task is already running."
+        return "Started task in background. You can keep chatting. Ask `status` for progress or `stop` to interrupt."
+
     def _format_plan_preview(self, execution_plan):
         lines = []
         for step in execution_plan[:MAX_TOOL_STEPS]:
@@ -1738,6 +1878,23 @@ class AssistantWithMemory:
         self.extract_long_term_memory(user_message)
         self.add_to_short_term("user", user_message)
         self.sync_plan_step_statuses_from_tasks()
+        msg_lower = str(user_message or "").strip().lower()
+
+        if msg_lower in {"status", "background status", "task status"}:
+            final_reply = self.background_status_text()
+            if not self.is_running_task and final_reply == "No background task is running.":
+                final_reply = self.executor.status_text()
+            self.add_to_short_term("assistant", final_reply)
+            self._finalize_agent_trace(final_reply)
+            self.save_memory()
+            return final_reply
+
+        if msg_lower in {"stop", "stop background", "stop task", "cancel background"} and self.is_running_task:
+            final_reply = self.request_stop_background_task()
+            self.add_to_short_term("assistant", final_reply)
+            self._finalize_agent_trace(final_reply)
+            self.save_memory()
+            return final_reply
 
         if self._is_plan_modification_request(user_message):
             final_reply = self.modify_current_plan(user_message)
@@ -1786,7 +1943,7 @@ class AssistantWithMemory:
         pending_plan = self.memory.get("pending_plan")
         if isinstance(pending_plan, dict):
             if self._is_confirmation(user_message):
-                final_reply = self._execute_pending_plan() or "No pending plan to confirm."
+                final_reply = self._start_pending_plan_background()
                 self.add_to_short_term("assistant", final_reply)
                 self._finalize_agent_trace(final_reply)
                 self.save_memory()
@@ -1813,9 +1970,14 @@ class AssistantWithMemory:
         if autonomous_cmd:
             action = autonomous_cmd["action"]
             if action == "run_cycle":
-                final_reply = self.executor.run_cycle()
+                if self.is_running_task:
+                    final_reply = "A background task is already running. Ask for status or stop it before starting another."
+                elif self.run_background_task("Autonomous execution cycle", self.executor.run_cycle):
+                    final_reply = "Started autonomous cycle in background. You can keep chatting. Ask `status` for progress or `stop` to interrupt."
+                else:
+                    final_reply = "A background task is already running."
             elif action == "status":
-                final_reply = self.executor.status_text()
+                final_reply = self.background_status_text() if self.is_running_task else self.executor.status_text()
             else:
                 final_reply = "I could not process that autonomous command."
         elif plan_cmd:

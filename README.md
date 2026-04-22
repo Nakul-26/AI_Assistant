@@ -54,6 +54,7 @@ Still needs manual end-to-end testing:
 - Task management: add, list, and complete tasks
 - Plan management: create multi-step plans, list plans, inspect plan status
 - Autonomous execution cycle for pending plan steps
+- Background mode for confirmed tool plans and autonomous cycles
 - Live `[Progress]` updates while an autonomous step is running
 - Planner + executor architecture for tool-augmented responses
 - Agent trace logging for planner steps, executed steps, context, and final answer
@@ -117,6 +118,12 @@ Set `ASSISTANT_TTS=0` to disable speech without uninstalling the package.
 On Windows, the assistant also includes a built-in PowerShell/System.Speech fallback for spoken output if `pyttsx3` is unavailable.
 
 Set `ASSISTANT_SPEAK_PROGRESS=1` if you also want autonomous progress lines spoken aloud during `run autonomous cycle`.
+
+## Background Mode
+
+Confirmed tool plans and `run autonomous cycle` now start in a background thread, so the CLI can keep accepting messages while work continues.
+
+Use `status` to see the current background step and `stop` to request interruption at the next safe checkpoint. Confirmations are still required for sensitive or dangerous actions.
 
 ## Voice Conversation Mode
 
